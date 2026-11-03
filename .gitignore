@@ -1,0 +1,8 @@
+# CMake build trees (the Visual Studio solution is generated into build/)
+build/
+out/
+
+# Visual Studio / IDE local state
+.vs/
+*.user
+CMakeUserPresets.json

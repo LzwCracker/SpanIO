@@ -1,0 +1,238 @@
+// ============================================================================
+// File purpose: Thin, platform-neutral wrappers over the socket lifecycle
+//               calls that differ between POSIX and Winsock: library start-up,
+//               socket creation, closing, non-blocking mode and error codes.
+//               Every function reports failures as std::error_code, so upper
+//               layers never touch errno or WSAGetLastError() directly.
+// Usage:        Internal header for the reactors and the tcp/udp classes.
+//               Call create_socket() to open a socket (it initializes Winsock
+//               on first use), then set_nonblocking() and close_socket().
+// Developer:    lzwcracker@gmail.com
+// Date:         2026-11-03
+// ============================================================================
+
+#ifndef SPANIO_DETAIL_SOCKET_OPS_H
+#define SPANIO_DETAIL_SOCKET_OPS_H
+
+#include "spanio/detail/platform.h"
+
+#include <system_error>
+
+namespace spanio { namespace detail {
+
+// ----------------------------------------------------------------------------
+// Error codes
+// ----------------------------------------------------------------------------
+
+// Fetch the error left by the most recent failed socket call on this thread
+// Return value: the Winsock error on Windows or errno on Linux, wrapped in
+//               std::system_category so it compares against std::errc values
+inline std::error_code last_error() noexcept
+{
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    return std::error_code(::WSAGetLastError(), std::system_category());
+#else
+    return std::error_code(errno, std::system_category());
+#endif
+}
+
+// ----------------------------------------------------------------------------
+// Winsock start-up
+// ----------------------------------------------------------------------------
+#if defined(SPANIO_PLATFORM_WINDOWS)
+
+// Major part of the Winsock version requested from WSAStartup (2.2)
+constexpr unsigned char kWinsockMajorVersion = 2;
+
+// Minor part of the Winsock version requested from WSAStartup (2.2)
+constexpr unsigned char kWinsockMinorVersion = 2;
+
+// Calls WSAStartup when constructed and WSACleanup when destroyed. A single
+// process-wide instance lives in ensure_network_initialized(), so users never
+// manage Winsock themselves and threads cannot initialize it twice.
+class winsock_init
+{
+public:
+    // Start Winsock 2.2 and remember whether it worked
+    winsock_init() noexcept
+    {
+        WSADATA data;
+        // WSAStartup returns its error directly instead of through
+        // WSAGetLastError(), because the error machinery is not up yet
+        const int result = ::WSAStartup(
+            MAKEWORD(kWinsockMajorVersion, kWinsockMinorVersion), &data);
+        m_result = std::error_code(result, std::system_category());
+        if (m_result)
+        {
+            log_error("WSAStartup", m_result);
+        }
+    }
+
+    // Release Winsock, but only if the matching WSAStartup succeeded
+    ~winsock_init()
+    {
+        if (!m_result)
+        {
+            ::WSACleanup();
+        }
+    }
+
+    winsock_init(const winsock_init&) = delete;
+    winsock_init& operator=(const winsock_init&) = delete;
+
+    // Result of the WSAStartup call made by the constructor
+    // Return value: empty error code on success, the Winsock error otherwise
+    const std::error_code& result() const noexcept
+    {
+        return m_result;
+    }
+
+private:
+    // Outcome of WSAStartup; empty means Winsock is usable and must be
+    // released with WSACleanup in the destructor
+    std::error_code m_result;
+};
+
+#endif
+
+// Make sure the platform socket library is ready. This is idempotent and
+// thread-safe; calls after the first one only read the cached result.
+// Return value: empty error code if sockets can be used, otherwise the error
+//               from WSAStartup. Always empty on Linux.
+inline std::error_code ensure_network_initialized() noexcept
+{
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    // Function-local static: C++11 guarantees exactly one thread-safe
+    // construction, and an inline function shares it across all translation
+    // units. It is destroyed (WSACleanup) during static destruction at exit.
+    static winsock_init s_init;
+    return s_init.result();
+#else
+    return std::error_code();
+#endif
+}
+
+// ----------------------------------------------------------------------------
+// Socket lifecycle
+// ----------------------------------------------------------------------------
+
+// Open a new socket. The handle is not inherited by child processes, and on
+// Windows it is created in overlapped mode so it can be bound to an IOCP.
+// Parameter family:   address family, e.g. AF_INET or AF_INET6
+// Parameter type:     socket type, e.g. SOCK_STREAM or SOCK_DGRAM
+// Parameter protocol: protocol, e.g. IPPROTO_TCP; 0 picks the default
+// Parameter ec:       set to the failure reason, or cleared on success
+// Return value: the new handle, or kInvalidHandle on failure
+inline native_handle_t create_socket(int family, int type, int protocol,
+                                     std::error_code& ec) noexcept
+{
+    ec = ensure_network_initialized();
+    if (ec)
+    {
+        return kInvalidHandle;
+    }
+
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    // Overlapped I/O is required by IOCP. WSA_FLAG_NO_HANDLE_INHERIT is the
+    // Winsock counterpart of SOCK_CLOEXEC (Windows 7 SP1 and later).
+    DWORD flags = WSA_FLAG_OVERLAPPED;
+#if defined(WSA_FLAG_NO_HANDLE_INHERIT)
+    flags |= WSA_FLAG_NO_HANDLE_INHERIT;
+#endif
+    const native_handle_t handle =
+        ::WSASocketW(family, type, protocol, nullptr, 0, flags);
+#else
+    // SOCK_CLOEXEC closes the descriptor atomically across exec(), avoiding
+    // the race of a separate fcntl(FD_CLOEXEC) call in a threaded program
+    const native_handle_t handle =
+        ::socket(family, type | SOCK_CLOEXEC, protocol);
+#endif
+
+    if (handle == kInvalidHandle)
+    {
+        ec = last_error();
+        log_error("create_socket", ec);
+        return kInvalidHandle;
+    }
+
+    ec.clear();
+    return handle;
+}
+
+// Close a socket handle. The handle must not be used afterwards, even if an
+// error is returned, because the system releases it in every case.
+// Parameter handle: socket to close; kInvalidHandle is rejected
+// Return value: empty error code on success; bad_file_descriptor for
+//               kInvalidHandle; otherwise the error reported by the system
+inline std::error_code close_socket(native_handle_t handle) noexcept
+{
+    if (handle == kInvalidHandle)
+    {
+        return std::make_error_code(std::errc::bad_file_descriptor);
+    }
+
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    const int result = ::closesocket(handle);
+#else
+    const int result = ::close(handle);
+#endif
+
+    if (result == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+#if defined(SPANIO_PLATFORM_LINUX)
+        // On Linux the descriptor is already released when close() fails
+        // with EINTR. Retrying could close a descriptor that another thread
+        // has just been given, so EINTR is treated as success.
+        if (ec.value() == EINTR)
+        {
+            return std::error_code();
+        }
+#endif
+        log_error("close_socket", ec);
+        return ec;
+    }
+
+    return std::error_code();
+}
+
+// Switch a socket between blocking and non-blocking mode
+// Parameter handle: an open socket
+// Parameter enable: true for non-blocking mode, false for blocking mode
+// Return value: empty error code on success, the system error otherwise
+inline std::error_code set_nonblocking(native_handle_t handle, bool enable) noexcept
+{
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    // FIONBIO treats any non-zero value as "enable non-blocking mode"
+    u_long mode = static_cast<u_long>(enable);
+    if (::ioctlsocket(handle, FIONBIO, &mode) == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+        log_error("set_nonblocking", ec);
+        return ec;
+    }
+#else
+    const int flags = ::fcntl(handle, F_GETFL);
+    if (flags == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+        log_error("set_nonblocking(F_GETFL)", ec);
+        return ec;
+    }
+
+    const int new_flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    // Skip the second system call when the mode is already the one requested
+    if (new_flags != flags && ::fcntl(handle, F_SETFL, new_flags) == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+        log_error("set_nonblocking(F_SETFL)", ec);
+        return ec;
+    }
+#endif
+
+    return std::error_code();
+}
+
+}}
+
+#endif // SPANIO_DETAIL_SOCKET_OPS_H
