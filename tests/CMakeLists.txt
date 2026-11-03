@@ -12,6 +12,7 @@
 set(SPANIO_TEST_NAMES
     test_socket_ops
     test_io_reactor
+    test_io_proactor
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)

@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-SpanIO is in the middle of **M1**. The platform adapter is done and tested on Windows: `platform.h`, `socket_ops.h`, the `io_reactor` interface, `epoll_reactor` and `iocp_reactor`. `io_context` and `tcp::socket` are next. `examples/`, `benchmark/` and `design/` are still empty, and there is no git repo yet. Design references:
+SpanIO is in the middle of **M1**. The platform adapter is done and tested on Windows:
+- `platform.h` and `socket_ops.h`
+- the `io_reactor` interface, with `epoll_reactor` and `iocp_reactor`
+- the `io_proactor` interface, with `iocp_proactor` and `reactor_proactor`
+
+`io_context` and `tcp::socket` are next. `examples/`, `benchmark/` and `design/` are still empty, and there is no git repo yet. Design references:
 
 - `docs/SpanIO.md` — the design (architecture, API shape, planned file layout, roadmap M1–M5)
 - `docs/code_rule.md` — mandatory coding and testing rules (summarized below)
@@ -20,7 +25,7 @@ ctest --test-dir build -C Debug -R test_socket_ops    # one test executable
 build/tests/Debug/test_socket_ops.exe close_socket    # only the cases whose name contains "close_socket"
 ```
 
-- `spanio::spanio` is an INTERFACE target that carries the include path, C++17, `Threads::Threads` and `ws2_32` (on Windows). The CMake option `-DSPANIO_ENABLE_LOG=ON` turns on the `detail::log_error` hook in `platform.h`.
+- `spanio::spanio` is an INTERFACE target that carries the include path, C++17, `Threads::Threads` and `ws2_32` (on Windows). The CMake option `-DSPANIO_ENABLE_LOG=ON` turns on the `detail::log_error` hook in `platform.h`. `-DSPANIO_WINDOWS_USE_AFD_REACTOR=ON` makes `make_platform_proactor` use the AFD readiness emulation on Windows instead of native IOCP. `test_io_proactor` runs every case against all backends of the platform regardless of this option.
 - Tests use the project's own zero-dependency framework, `tests/test_framework.h`:
   - Define a case with `SPANIO_TEST(name)`.
   - `SPANIO_CHECK` records a failure and continues the case; `SPANIO_REQUIRE` records a failure and stops the case.
@@ -61,12 +66,32 @@ SpanIO is a header-only C++17 network library for Linux and Windows with no thir
    `iocp_reactor` gets readiness through the **undocumented `IOCTL_AFD_POLL`** on a `\Device\Afd` handle bound to an IOCP (the wepoll/libuv/mio technique), with ntdll functions loaded at run time:
    - Each socket has one in-flight request. The kernel writes into `afd_socket_state` until that request's completion packet is processed, so a state is never freed while a request is pending. `del()` moves it to `m_zombies`, and the destructor cancels requests and drains completions.
    - Level-triggered behaviour is emulated by re-submitting, at the start of the next `poll()`, a request for each socket that reported events.
+
+   **`io_proactor`** (`io_proactor.h`, design doc 4.4) is the completion interface that the execution engine will use; it never talks to `io_reactor` directly. The interface:
+   - Callers own an `io_operation`, fill it with `prepare_accept/connect/recv/send/post`, `start()` it, and get it back from `poll()` with `m_ec`, `m_bytes` and `m_accepted` filled in.
+   - Every operation comes back **exactly once**, including failures and cancellations. `start()` never completes synchronously.
+   - A cancelled operation reports `errc::operation_canceled` on every backend.
+   - Each socket allows at most one read-side operation and one write-side operation at a time.
+   - Before closing a socket, call `unregister_handle`. Before destroying a proactor, every operation must have come back.
+
+   The two implementations:
+   - `iocp_proactor` is the Windows default. It uses native `AcceptEx/ConnectEx/WSARecv/WSASend` and documented APIs only.
+     - `io_operation::m_overlapped` must stay the first member: completions are cast back from `OVERLAPPED*`.
+     - Calls that fail immediately are re-posted to the port by hand, to keep the exactly-once promise.
+     - Errors go through `WSAGetOverlappedResult`, so their Winsock codes match the adapter's.
+   - `reactor_proactor` wraps any `io_reactor`. It is the Linux default, and the Windows choice when `SPANIO_WINDOWS_USE_AFD_REACTOR` is defined.
+     - It tries the I/O speculatively in `start()`.
+     - It parks an operation on its socket only when the I/O would block.
+     - It `add`s a socket to the reactor only while an operation is parked, and `del`s it when none is. Error and hang-up events are always reported, so keeping an idle socket in a level-triggered reactor would make `poll()` spin.
+
+   `make_platform_proactor(ec)` in `platform_proactor.h` picks the backend.
 2. **Execution engine**: `io_context` (the event loop; `run()` can be called from several threads, which share one task queue), `executor`, and `strand` (handlers bound to one strand never run at the same time).
 3. **Unified API**: `tcp::acceptor`, `tcp::socket`, `udp::socket`, `timer`, `resolver`. Each object is constructed with an `io_context`, starts `async_*` operations, and gets results through a handler `(std::error_code, result)`.
 
 **Proactor semantics on every platform**: when a handler runs, the data is already in the user's buffer.
-- Windows (IOCP + AFD_POLL) and Linux (epoll) take the **same emulation path**: the framework waits for readiness from `io_reactor`, does the `recv`/`send` itself, then posts a completion event to the `io_context` queue. So the execution engine has a single code path.
-- The original design used a native IOCP proactor (`WSARecv`/`AcceptEx`) on Windows. That was dropped in design doc v0.2 and may come back later as an optional backend if benchmarks call for it.
+- On Windows (by default), the native IOCP proactor delivers real completions.
+- On Linux (and on Windows with the AFD option), `reactor_proactor` waits for readiness, does the `recv`/`send` itself, and returns the finished operation.
+- The execution engine only sees `io_proactor`, so it has a single code path on every platform.
 - On Linux with io_uring, operations are submitted to the SQ and their completions are collected from the CQ.
 
 Callback, future and coroutine styles all run on the same completion events and differ only in the CompletionToken.

@@ -29,6 +29,11 @@ option(SPANIO_BUILD_TESTS "Build the SpanIO unit tests" ${SPANIO_IS_TOP_LEVEL})
 # will be added together with those modules.
 option(SPANIO_ENABLE_LOG "Enable the built-in lightweight logging" OFF)
 
+# Windows only: use the readiness emulation (reactor_proactor over the
+# IOCP + AFD poll reactor) instead of the native IOCP proactor
+option(SPANIO_WINDOWS_USE_AFD_REACTOR
+    "Windows: emulate completions over IOCP + AFD poll instead of native IOCP" OFF)
+
 find_package(Threads REQUIRED)
 
 add_library(spanio INTERFACE)
@@ -51,6 +56,10 @@ endif()
 
 if(SPANIO_ENABLE_LOG)
     target_compile_definitions(spanio INTERFACE SPANIO_ENABLE_LOG)
+endif()
+
+if(SPANIO_WINDOWS_USE_AFD_REACTOR)
+    target_compile_definitions(spanio INTERFACE SPANIO_WINDOWS_USE_AFD_REACTOR)
 endif()
 
 if(SPANIO_BUILD_TESTS)

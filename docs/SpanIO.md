@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.2（设计草案，按 M1 实现修订）
+> 版本：v0.3（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.3 修订记录（2026-11-04）**：增加原生 IOCP Proactor 后端。
+> - 新增 4.4：异步操作接口 `io_proactor`，有两个实现：原生 `iocp_proactor`，以及建立在任意 `io_reactor` 之上的 `reactor_proactor` 适配器。
+> - 5.2：Windows **默认改回原生 IOCP Proactor**；定义 `SPANIO_WINDOWS_USE_AFD_REACTOR` 时改用 IOCP + AFD_POLL 就绪模拟。
+> - 8.4 / 十三：适配器在 socket 没有挂起操作时把它**从 reactor 注销**，而不是用 `mod()` 清空关注。
 >
 > **v0.2 修订记录（2026-11-03）**：根据 M1 平台适配层的实现同步本文档。
 > - 4.2：`io_reactor` 接口加入错误码和 `interrupt()`，并明确线程与触发约定。
@@ -171,6 +176,59 @@ io_reactor_ptr make_platform_reactor(std::error_code& ec);
 
 - **`select_reactor`（Windows & Linux，计划中）**：基于两个平台都提供的 POSIX 标准接口 `select`。
 
+### 4.4 异步操作抽象 io_proactor（v0.3 新增）
+
+执行引擎面对的是“提交操作、取回完成结果”的接口，而不是就绪接口（实现见 `include/spanio/detail/io_proactor.h`）：
+
+```cpp
+namespace spanio { namespace detail {
+
+// 一个异步操作：由调用方持有，用 prepare_accept / prepare_connect /
+// prepare_recv / prepare_send / prepare_post 填写；结果写回 m_ec、m_bytes、m_accepted
+struct io_operation;
+
+class io_proactor
+{
+public:
+    virtual ~io_proactor() = default;
+    virtual std::error_code register_handle(native_handle_t handle) = 0;   // 使用前注册 socket
+    virtual std::error_code unregister_handle(native_handle_t handle) = 0; // 关闭前注销，挂起操作以取消返回
+    virtual void start(io_operation* op) = 0;                              // 发起 accept / connect / recv / send
+    virtual void cancel(native_handle_t handle) = 0;                       // 取消该 socket 上的全部挂起操作
+    virtual void post(io_operation* op) = 0;                               // 投递一个无 IO 的任务
+    virtual std::size_t poll(completion_list& out, int timeout_ms, std::error_code& ec) = 0;
+    virtual void interrupt() noexcept = 0;
+    virtual const char* name() const noexcept = 0;
+};
+
+io_proactor_ptr make_platform_proactor(std::error_code& ec); // 按平台与配置选择后端
+
+}}
+```
+
+所有后端共同遵守的约定：
+
+| 约定      | 内容                                                                                               |
+| ------- | ------------------------------------------------------------------------------------------------ |
+| 恰好一次    | 每个发起或投递的操作都会被 `poll()` **恰好返回一次**，包括失败与取消；`start()` 从不同步完成操作（避免回调重入）                                  |
+| 内存归属    | `io_operation` 由调用方持有，在被 `poll()` 返回前必须保持有效且不被改动                                                   |
+| 并发限制    | 每个 socket 同时最多一个读侧操作（accept / recv）和一个写侧操作（connect / send）                                          |
+| 读写语义    | recv 返回 0 字节表示对端关闭；send 可能只发送部分数据，调用方继续发送剩余部分                                                    |
+| 错误码     | 取消统一报告 `errc::operation_canceled`；原生后端通过 `WSAGetOverlappedResult` 转换为 Winsock 错误码，与适配器路径一致（如 `WSAECONNRESET`） |
+| 线程安全    | `register/unregister/start/cancel/post/interrupt` 可在任意线程调用；同一时刻只允许一个线程调用 `poll()`                        |
+| 生命周期    | 关闭 socket 前确保其上没有挂起操作并 `unregister_handle()`；销毁 proactor 前所有操作必须已被取回                                   |
+
+两个实现：
+
+- **`iocp_proactor`（Windows 默认）**：原生 Proactor，直接使用 `AcceptEx / ConnectEx / WSARecv / WSASend` 与完成端口，**只用公开 API**，没有就绪通知往返。
+  - `AcceptEx` 需要预先创建的接收 socket，完成后设置 `SO_UPDATE_ACCEPT_CONTEXT`。
+  - `ConnectEx` 要求 socket 已绑定，未绑定时自动绑定到通配地址，完成后设置 `SO_UPDATE_CONNECT_CONTEXT`。
+  - 发起时就失败的请求不会产生完成包，后端手动投递一个，以兑现“恰好返回一次”。
+
+- **`reactor_proactor`（Linux 默认，Windows 可选）**：在任意 `io_reactor` 之上“用 Reactor 模拟 Proactor”（见 5.2）。
+  - 发起操作时先**试探性地立即执行一次**非阻塞 IO，只有会阻塞时才把操作挂到 socket 上并向 reactor 申请就绪通知。
+  - socket 有挂起操作时才加入 reactor，没有时立即注销（原因见 8.4）。
+
 ### 4.3 线程与同步原语
 
 - 统一使用 C++17 标准库的 `std::thread`、`std::mutex`、`std::condition_variable`、`std::atomic`，由标准库负责适配底层（Linux futex / Windows 内核对象）。
@@ -196,13 +254,14 @@ io_reactor_ptr make_platform_reactor(std::error_code& ec);
 
 | 平台        | 底层机制     | 对外语义     | 实现方式                                                                             |
 | --------- | -------- | -------- | -------------------------------------------------------------------------------- |
-| Windows   | IOCP + AFD_POLL | Proactor | **以 Reactor 模拟 Proactor**：AFD_POLL 请求经 IOCP 报告就绪 → 框架内部发起 `recv/send` → 完成后封装为完成事件投递到任务队列 |
-| Linux（默认） | epoll    | Proactor | **以 Reactor 模拟 Proactor**：epoll 等待就绪 → 框架内部线程发起 `read/write` → 完成后封装为完成事件投递到任务队列 |
+| Windows（默认） | IOCP     | Proactor | **原生 Proactor**（`iocp_proactor`）：直接投递 `AcceptEx / ConnectEx / WSARecv / WSASend`，完成包经 IOCP 取回 |
+| Windows（可选） | IOCP + AFD_POLL | Proactor | **以 Reactor 模拟 Proactor**（`reactor_proactor` + `iocp_reactor`）：AFD_POLL 请求经 IOCP 报告就绪 → 框架内部发起 `recv/send` → 封装为完成事件。定义 `SPANIO_WINDOWS_USE_AFD_REACTOR`（CMake 同名选项）启用 |
+| Linux（默认） | epoll    | Proactor | **以 Reactor 模拟 Proactor**（`reactor_proactor` + `epoll_reactor`）：epoll 等待就绪 → 框架内部发起 `read/write` → 封装为完成事件 |
 | Linux（可选） | io_uring | Proactor | **原生异步**：直接向 SQ 提交读写请求，CQ 收割完成结果，无模拟层开销                                          |
 
-> v0.2 变更：Windows 原计划直接投递 `WSARecv / WSASend / AcceptEx` 走原生 Proactor。由于平台层统一为就绪接口（4.2），Windows 现在与 Linux 走**同一条模拟路径**，执行引擎只需维护一套代码。代价是 Windows 上每次 IO 多一次就绪通知往返。若以后基准测试显示这是瓶颈，可以再增加原生 IOCP Proactor 后端作为可选项。
+> v0.3 变更：v0.2 曾让 Windows 也只走就绪模拟路径。v0.3 增加了 `io_proactor` 抽象层（4.4），执行引擎只面对这一个接口，因此原生 IOCP 可以作为 Windows 默认后端，而不必维护第二套引擎代码。默认后端只用公开 API，也少一次就绪通知往返；AFD 就绪模拟保留为可选项，用于需要和 Linux 行为最一致的场景。
 
-**用就绪通知模拟 Proactor 的关键流程**（两个平台相同，下面以 epoll 为例）：
+**用就绪通知模拟 Proactor 的关键流程**（`reactor_proactor`，下面以 epoll 为例）：
 
 ```
 用户调用 async_read(socket, buffer, handler)
@@ -414,7 +473,7 @@ int main() {
 - **所有后端统一使用水平触发（LT）**（v0.2 修订，原方案为 epoll 边沿触发 ET）。原因：
   - **跨平台一致**：Windows 后端的 AFD_POLL 请求每次只完成一次，用“重新投递”模拟 LT 很自然；但无法可靠地模拟 ET，因为框架不知道用户何时读空了缓冲区。为了让两个平台对上层的行为完全一致，统一采用 LT。
   - **更安全**：在 LT 下，执行引擎即使漏读一部分数据，下一次 `poll()` 也会再次报告；在 ET 下必须读到 `EAGAIN` 为止，否则连接会永久“沉默”。
-  - **代价与对策**：对于持续就绪但暂时不处理的 socket，LT 会重复报告。执行引擎通过“没有挂起的异步操作时用 `mod()` 取消关注”来避免空转。若基准测试显示需要，可在后续版本为 epoll 后端增加可选的 ET 模式。
+  - **代价与对策**：对于持续就绪但暂时不处理的 socket，LT 会重复报告。`reactor_proactor` 适配器只在 socket 有挂起操作时把它加入 reactor，没有时立即 `del()` 注销（v0.3 修订：原方案是用 `mod()` 清空关注）。原因是错误与挂断事件总会上报，仅清空关注无法阻止它们；例如 epoll 对尚未连接的 socket 会持续报告 `EPOLLHUP`，在 LT 下会让 `poll()` 空转。若基准测试显示需要，可在后续版本为 epoll 后端增加可选的 ET 模式。
 - 可选 io_uring 后端通过批量提交/收割，进一步降低系统调用次数。
 - Windows 后端用 `GetQueuedCompletionStatusEx` 一次批量取回多个完成包（每次最多 `kMaxEventsPerPoll` 个）。
 
@@ -426,7 +485,7 @@ int main() {
 | -------- | ------------------------------------------- | ----------------------------------------- |
 | 上手门槛     | 极简 API，几行启动服务，无强制继承体系                       | 执行器、io_context、完成令牌等概念较多，学习曲线陡            |
 | 依赖       | 仅 C++17 标准库，零三方依赖                           | 通常强依赖 Boost 生态，或使用 standalone 版本          |
-| 平台 IO 后端 | Windows IOCP + AFD_POLL（就绪模型）；Linux 支持 epoll 与可选 io_uring | Windows IOCP；Linux epoll（io_uring 支持在演进中） |
+| 平台 IO 后端 | Windows 原生 IOCP（可选 IOCP + AFD_POLL 就绪模拟）；Linux 支持 epoll 与可选 io_uring | Windows IOCP；Linux epoll（io_uring 支持在演进中） |
 | 编译体积/速度  | header-only + 编译期裁剪，核心精简                    | 模板实例化较重，编译时间偏长                            |
 | 抽象层次     | 保留可下沉到就绪事件的能力，同时默认给完成语义                     | 统一 Proactor 抽象，Reactor 细节对用户较透明           |
 | 目标       | 轻量、易用、跨平台一致                                 | 功能全面、生态成熟、事实标准                            |
@@ -459,6 +518,10 @@ spanio/
 │           ├── platform_reactor.h  # 按平台选择默认后端（已实现）
 │           ├── epoll_reactor.h     # Linux epoll 后端，水平触发（已实现）
 │           ├── iocp_reactor.h      # Windows IOCP + AFD_POLL 后端（已实现）
+│           ├── io_proactor.h       # 异步操作抽象接口与 io_operation（已实现）
+│           ├── iocp_proactor.h     # Windows 原生 IOCP Proactor，默认（已实现）
+│           ├── reactor_proactor.h  # 在 io_reactor 上模拟 Proactor 的适配器（已实现）
+│           ├── platform_proactor.h # 按平台与配置选择默认 proactor（已实现）
 │           ├── io_uring_reactor.h  # Linux io_uring 后端
 │           └── select_reactor.h    # Linux&Windows 通用后端
 │    
@@ -536,9 +599,10 @@ cl /std:c++17 /Iinclude examples\echo_server.cpp ws2_32.lib
 
 | 风险点               | 说明                        | 应对策略                               |
 | ----------------- | ------------------------- | ---------------------------------- |
-| 模拟 Proactor 的额外开销 | Linux 与 Windows 默认路径都多一次就绪通知往返      | Linux 提供 io_uring 后端作为高性能选项；Windows 视基准测试结果再增加原生 IOCP Proactor 后端；内部读尽量复用线程与缓冲 |
-| AFD_POLL 为未公开接口   | Windows 后端依赖 `IOCTL_AFD_POLL` 等未公开的内核接口，微软未承诺兼容 | 该接口自 Vista 起保持稳定，并被 libuv、mio、wepoll 长期使用；ntdll 函数在运行期查找，缺失时 `create()` 返回 `function_not_supported` 而不是崩溃；保留以后增加 `select_reactor` 作为兜底的空间 |
-| 水平触发的重复通知        | 持续就绪但暂不处理的 socket 每次 `poll()` 都会被报告 | 执行引擎在没有挂起操作时用 `mod()` 取消关注；必要时为 epoll 增加可选 ET 模式 |
+| 模拟 Proactor 的额外开销 | Linux 默认路径（以及 Windows 可选的 AFD 路径）多一次就绪通知往返      | Linux 提供 io_uring 后端作为高性能选项；Windows 默认已是原生 IOCP Proactor；适配器发起操作时先试探性执行一次 IO，数据已就绪时省去往返 |
+| AFD_POLL 为未公开接口   | 可选的 Windows AFD 路径依赖 `IOCTL_AFD_POLL` 等未公开的内核接口，微软未承诺兼容 | v0.3 起 Windows 默认使用只依赖公开 API 的原生 IOCP，AFD 路径仅在显式启用时使用；该接口自 Vista 起保持稳定，并被 libuv、mio、wepoll 长期使用；ntdll 函数在运行期查找，缺失时 `create()` 返回 `function_not_supported` 而不是崩溃 |
+| 水平触发的重复通知        | 持续就绪但暂不处理的 socket 每次 `poll()` 都会被报告 | 适配器在 socket 没有挂起操作时把它从 reactor 注销；必要时为 epoll 增加可选 ET 模式 |
+| 两个 Windows 后端行为差异 | 原生 IOCP 与 AFD 模拟在边界情况（错误码、部分发送）上可能不同 | 同一套 `test_io_proactor` 用例对两个后端都运行，约定见 4.4 |
 | io_uring 兼容性      | 需 Linux 5.1+ 内核与 liburing | 设为编译期可选，默认关闭，运行期探测降级               |
 | 协程依赖 C++20        | 提高编译器门槛                   | 协程作为可选模块，不影响核心使用                   |
 | 头文件编译膨胀           | header-only 可能拖慢编译        | 提供分离编译模式；模板尽量外提，减少实例化              |
