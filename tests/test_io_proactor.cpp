@@ -22,10 +22,7 @@
 #include "spanio/detail/platform_proactor.h"
 #include "test_framework.h"
 #include "test_net_helpers.h"
-
-#if defined(SPANIO_PLATFORM_WINDOWS)
-#include "spanio/detail/iocp_proactor.h"
-#endif
+#include "test_proactor_backends.h"
 
 #include <chrono>
 #include <cstdio>
@@ -37,6 +34,9 @@
 #include <vector>
 
 using namespace spanio::detail;
+using spanio::test::announce;
+using spanio::test::backend_factory;
+using spanio::test::backends;
 using spanio::test::local_address;
 using spanio::test::make_loopback_listener;
 using spanio::test::make_tcp_pair;
@@ -119,46 +119,6 @@ constexpr char kAdapterName[] = "reactor-proactor";
 
 // Clock used for all time measurements
 using test_clock = std::chrono::steady_clock;
-
-// One backend under test
-struct backend_factory
-{
-    // Label printed before the backend's checks
-    const char* m_label;
-    // Function creating a fresh instance
-    io_proactor_ptr (*m_create)(std::error_code&);
-};
-
-#if defined(SPANIO_PLATFORM_WINDOWS)
-// Create the native IOCP proactor through the common pointer type
-// Parameter ec: set to the failure reason, or cleared
-// Return value: the proactor, or nullptr
-io_proactor_ptr create_native_proactor(std::error_code& ec)
-{
-    return iocp_proactor::create(ec);
-}
-#endif
-
-// Every backend available on this platform
-// Return value: list of factories, never empty
-std::vector<backend_factory> backends()
-{
-    std::vector<backend_factory> list;
-#if defined(SPANIO_PLATFORM_WINDOWS)
-    list.push_back(backend_factory{"iocp-proactor (native)", &create_native_proactor});
-    list.push_back(backend_factory{"reactor-proactor over iocp-afd", &make_reactor_proactor});
-#else
-    list.push_back(backend_factory{"reactor-proactor over epoll", &make_reactor_proactor});
-#endif
-    return list;
-}
-
-// Print which backend the following checks belong to
-// Parameter backend: backend about to be tested
-void announce(const backend_factory& backend)
-{
-    std::printf("    [%s]\n", backend.m_label);
-}
 
 // Create a proactor or fail the case
 // Parameter backend: which backend to create

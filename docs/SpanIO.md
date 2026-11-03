@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.3（设计草案，按 M1 实现修订）
+> 版本：v0.4（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.4 修订记录（2026-11-04）**：实现执行引擎 `io_context`。
+> - 5.3：按实现重写 `io_context` 接口与语义（工作计数、`restart`、多线程 `run()` 的单轮询者模型、异常与析构），`io_context` 不再自建线程，去掉 `concurrency_hint`。
+> - 十：同步工程结构（`io_context.h`、`detail/scheduler_op.h`）。
 >
 > **v0.3 修订记录（2026-11-04）**：增加原生 IOCP Proactor 后端。
 > - 新增 4.4：异步操作接口 `io_proactor`，有两个实现：原生 `iocp_proactor`，以及建立在任意 `io_reactor` 之上的 `reactor_proactor` 适配器。
@@ -286,36 +290,60 @@ reactor.poll() 报告该 socket 可读（就绪通知）
 
 ### 5.3 统一事件分发器
 
-上层只与一个分发器交互，不感知底层模型：
+上层只与一个分发器 `io_context` 交互，不感知底层模型（实现见 `include/spanio/io_context.h`，语义参照 Asio）：
 
 ```cpp
 namespace spanio {
 
-class io_context {
+class io_context
+{
 public:
-    explicit io_context(std::size_t concurrency_hint = 1);
+    class executor_type;                       // 轻量句柄：post / dispatch / running_in_this_thread / context()
 
-    // 运行事件循环（可多线程并发调用 run）
-    std::size_t run();
-    std::size_t poll();
-    void stop();
+    io_context();                              // 使用 make_platform_proactor()，失败抛 std::system_error
+    explicit io_context(detail::io_proactor_ptr proactor); // 指定后端（测试覆盖全部后端时使用）
 
-    // 提交一个待执行任务
-    template <typename Fn>
-    void post(Fn&& fn);
+    std::size_t run();                         // 运行到没有工作或 stop()；返回执行的 handler 数
+    std::size_t run_one();                     // 阻塞直到执行一个 handler
+    std::size_t poll();                        // 只执行当前已就绪的 handler，不阻塞
+    std::size_t poll_one();
+    void stop();                               // 任意线程可调用，唤醒所有 run() 中的线程
+    bool stopped() const;
+    void restart();                            // 停止或工作耗尽后，再次运行前调用
+
+    template <typename Fn> void post(Fn&& fn);     // 只入队，从不在调用处执行
+    template <typename Fn> void dispatch(Fn&& fn); // 当前线程在本 context 的 run() 内则直接执行，否则 post
+    executor_type get_executor() noexcept;
 
 private:
-    detail::io_reactor_ptr reactor_;   // 平台适配层
-    detail::task_queue       tasks_;   // 就绪完成事件 / 用户任务
-    std::vector<std::thread> threads_; // 工作线程（模拟 Proactor 时使用）
+    detail::io_proactor_ptr m_proactor;        // 平台后端（见 4.4）
+    detail::op_queue        m_queue;           // 就绪的完成 handler / 用户任务
+    // ...互斥量、条件变量、工作计数等
 };
+
+class executor_work_guard;                     // make_work_guard(ctx)：工作耗尽时 run() 也不返回
 
 } // namespace spanio
 ```
 
-- 分发器统一把「底层就绪事件」转换为「完成事件」或「用户任务」入队。
-- 多线程 `run()` 时，多个工作线程从同一队列取任务执行，天然支持多核扩展。
-- 用户注册的回调（`on_read / on_write / on_connect / on_accept`）由分发器在完成事件到达时调用。
+v0.4 确定的语义：
+
+| 约定        | 内容                                                                                                             |
+| --------- | -------------------------------------------------------------------------------------------------------------- |
+| 线程来源      | 由用户线程调用 `run()`，`io_context` 自身**不创建线程**（取消 v0.3 草图中的 `concurrency_hint` 和 `threads_`）                            |
+| 工作计数      | “工作” = 队列中的 handler + 已发起未完成的 IO 操作 + 存活的 `executor_work_guard`。降为 0 或调用 `stop()` 时 `run()` 返回，此后 `stopped()` 为真，需 `restart()` 才能再次运行 |
+| 多线程 run() | proactor 同一时刻只允许一个线程 `poll()`：同一时刻只有一个线程充当轮询者，把完成的 IO 操作转换成 handler 入队；其余线程在条件变量上等待并从队列取 handler。任意线程 `post` 时唤醒一个等待线程，没有等待线程时 `interrupt()` 轮询者 |
+| 异常        | handler 抛出的异常从 `run()` 传出，context 状态保持一致，再次调用 `run()` 继续执行剩余 handler                                          |
+| 析构        | 未执行的 handler 只销毁不调用；先从 proactor 取回所有已发起的 IO 操作（调用方应已取消或注销其 socket）再销毁。最多等待 5 秒，超时则记录日志并泄漏，而不是释放内核仍可能写入的内存 |
+
+任务节点（`detail/scheduler_op.h`）：
+
+- `scheduler_op` 是侵入式链表节点，用函数指针分发（无虚函数），run 或 destroy 恰好一次，两者都释放节点。
+- IO 操作节点 `io_op<Handler>` 同时继承 `io_operation` 与 `scheduler_op`：同一个堆对象先交给 proactor，完成后由 `static_cast` 转回并放入任务队列，**不需要额外分配**，`io_operation` 的定义也不用改。
+- 被丢弃的 accept 操作会关闭已接受的 socket，避免泄漏。
+- 供 IO 对象（`tcp::socket` 等）使用的内部接口：`register_handle / unregister_handle / cancel_handle / start_io(io_op_base*)`。
+
+用户回调由 `io_context` 在完成事件到达时调用；此时数据已在用户缓冲区（Proactor 语义）。
 
 ---
 
@@ -502,7 +530,7 @@ spanio/
 ├── include/
 │   └── spanio/
 │       ├── spanio.h                # 总入口
-│       ├── io_context.h            # 执行引擎
+│       ├── io_context.h            # 执行引擎：事件循环、任务队列、executor、work guard（已实现）
 │       ├── executor.h              # 执行器抽象
 │       ├── strand.h                # 串行化域
 │       ├── error.h                 # 统一错误码
@@ -522,6 +550,7 @@ spanio/
 │           ├── iocp_proactor.h     # Windows 原生 IOCP Proactor，默认（已实现）
 │           ├── reactor_proactor.h  # 在 io_reactor 上模拟 Proactor 的适配器（已实现）
 │           ├── platform_proactor.h # 按平台与配置选择默认 proactor（已实现）
+│           ├── scheduler_op.h      # io_context 任务节点与侵入式队列（已实现）
 │           ├── io_uring_reactor.h  # Linux io_uring 后端
 │           └── select_reactor.h    # Linux&Windows 通用后端
 │    
