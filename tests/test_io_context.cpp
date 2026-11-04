@@ -41,6 +41,7 @@ using spanio::detail::prepare_recv;
 using spanio::test::announce;
 using spanio::test::backend_factory;
 using spanio::test::backends;
+using spanio::test::make_context;
 using spanio::test::make_tcp_pair;
 using spanio::test::socket_guard;
 
@@ -115,18 +116,6 @@ long long elapsed_ms(test_clock::time_point start)
 void helper_delay()
 {
     std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
-}
-
-// Create a context on a given backend or fail the case
-// Parameter backend: which proactor to use
-// Return value: the context, never null
-std::unique_ptr<io_context> make_context(const backend_factory& backend)
-{
-    std::error_code ec;
-    io_proactor_ptr proactor = backend.m_create(ec);
-    SPANIO_REQUIRE(!ec);
-    SPANIO_REQUIRE(proactor != nullptr);
-    return std::unique_ptr<io_context>(new io_context(std::move(proactor)));
 }
 
 // Destroy a context and check it did not wait for I/O it should already

@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.4（设计草案，按 M1 实现修订）
+> 版本：v0.5（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.5 修订记录（2026-11-04）**：实现 TCP 接口。
+> - 6.2：按实现重写 `tcp::socket / tcp::acceptor` 接口与约定；`async_read` 改名为 `async_read_some`，新增组合操作 `async_write`；新增 `ip.h`、`buffer.h`、`error.h`。
+> - 7.2：回显示例改为可编译的写法，修正 v0.4 草图中“发起读操作后移走 socket”的缺陷。
+> - 4.4：原生 IOCP 后端直接识别 `STATUS_CANCELLED`，修复“注销后立即关闭 socket 时取消被报告为 `WSAENOTSOCK`”的问题。
+> - 十：同步工程结构。
 >
 > **v0.4 修订记录（2026-11-04）**：实现执行引擎 `io_context`。
 > - 5.3：按实现重写 `io_context` 接口与语义（工作计数、`restart`、多线程 `run()` 的单轮询者模型、异常与析构），`io_context` 不再自建线程，去掉 `concurrency_hint`。
@@ -218,7 +224,7 @@ io_proactor_ptr make_platform_proactor(std::error_code& ec); // 按平台与配�
 | 内存归属    | `io_operation` 由调用方持有，在被 `poll()` 返回前必须保持有效且不被改动                                                   |
 | 并发限制    | 每个 socket 同时最多一个读侧操作（accept / recv）和一个写侧操作（connect / send）                                          |
 | 读写语义    | recv 返回 0 字节表示对端关闭；send 可能只发送部分数据，调用方继续发送剩余部分                                                    |
-| 错误码     | 取消统一报告 `errc::operation_canceled`；原生后端通过 `WSAGetOverlappedResult` 转换为 Winsock 错误码，与适配器路径一致（如 `WSAECONNRESET`） |
+| 错误码     | 取消统一报告 `errc::operation_canceled`；原生后端通过 `WSAGetOverlappedResult` 转换为 Winsock 错误码，与适配器路径一致（如 `WSAECONNRESET`）。原生后端直接识别 `STATUS_CANCELLED` 判定取消：常见时序是注销（`CancelIoEx`）后立即 `closesocket`，处理完成包时句柄可能已关闭，此时 `WSAGetOverlappedResult` 会返回 `WSAENOTSOCK`（v0.5 修复） |
 | 线程安全    | `register/unregister/start/cancel/post/interrupt` 可在任意线程调用；同一时刻只允许一个线程调用 `poll()`                        |
 | 生命周期    | 关闭 socket 前确保其上没有挂起操作并 `unregister_handle()`；销毁 proactor 前所有操作必须已被取回                                   |
 
@@ -361,42 +367,76 @@ io_context ──┬── tcp::acceptor  （监听 + accept）
 
 所有异步对象均遵循：**构造时绑定 io_context → 发起异步操作并指定 handler → handler 中拿到结果与错误码**。
 
-### 6.2 核心 API（示例语义）
+### 6.2 核心 API（v0.5 已实现）
+
+实现见 `include/spanio/tcp.h`，辅助类型在 `ip.h`（`ip::address`、`ip::make_address`、`ipv4::any/loopback`、`ipv6::any/loopback`）、`buffer.h`（`mutable_buffer / const_buffer` 与 `spanio::buffer(...)`）、`error.h`（`spanio::error::eof`）。
 
 ```cpp
-namespace spanio::tcp {
+namespace spanio { namespace tcp {
 
-class socket {
+class endpoint;                                   // IP 地址 + 端口，可与 sockaddr 互转
+
+class socket                                      // 只可移动
+{
 public:
     explicit socket(io_context& ctx);
-    socket(io_context& ctx, native_handle_t handle);
-
-    // 异步连接
-    template <typename Handler>
-    void async_connect(const endpoint& ep, Handler&& h);
-
-    // 异步读（Proactor 语义：回调时数据已在 buffer 中）
-    template <typename MutableBuffer, typename Handler>
-    void async_read(MutableBuffer buf, Handler&& h);
-
-    // 异步写
-    template <typename ConstBuffer, typename Handler>
-    void async_write(ConstBuffer buf, Handler&& h);
-
-    void close();
+    std::error_code open(int family);             // async_connect 在未打开时会自动 open
+    std::error_code assign(native_handle_t handle);
+    bool is_open() const;
     native_handle_t native_handle() const;
+    endpoint local_endpoint(std::error_code& ec) const;
+    endpoint remote_endpoint(std::error_code& ec) const;
+    std::error_code shutdown(shutdown_type what); // shutdown_receive / shutdown_send / shutdown_both
+    void cancel();                                // 挂起操作以 operation_canceled 完成
+    void close();                                 // 注销 → 取消 → 关闭；handler 仍恰好执行一次
+
+    template <typename H> void async_connect(const endpoint& peer, H&& h);       // h(std::error_code)
+    template <typename H> void async_read_some(mutable_buffer buf, H&& h);       // h(ec, n)，可能只读到一部分
+    template <typename H> void async_write_some(const_buffer buf, H&& h);        // h(ec, n)，可能只写出一部分
+    template <typename H> void async_write(const_buffer buf, H&& h);             // h(ec, n)，写完全部或出错才回调
 };
 
-} // namespace spanio::tcp
+class acceptor                                    // 只可移动
+{
+public:
+    explicit acceptor(io_context& ctx);
+    acceptor(io_context& ctx, const endpoint& local); // open + bind + listen，失败抛 std::system_error
+    std::error_code open(int family);
+    std::error_code bind(const endpoint& local);
+    std::error_code listen(int backlog = SOMAXCONN);
+    endpoint local_endpoint(std::error_code& ec) const;
+    void cancel();
+    void close();
+    template <typename H> void async_accept(H&& h);                              // h(ec, tcp::socket)
+};
+
+}}
 ```
 
-handler 统一签名风格（以 `std::error_code` + 结果参数为主）：
+约定：
+
+| 约定        | 内容                                                                                              |
+| --------- | ----------------------------------------------------------------------------------------------- |
+| 命名        | 沿用 Asio：`async_read_some / async_write_some` 允许部分传输，`async_write` 是写完整个缓冲区的组合操作。v0.4 草图中的 `async_read` 实际是“读一部分”语义，已改名，避免误解为“读满缓冲区” |
+| 回调时机      | handler 一律在 `io_context::run()` 中执行，**从不在发起调用里内联执行**，包括立即失败（如 socket 未打开报 `bad_file_descriptor`）和空缓冲区（成功、0 字节） |
+| 恰好一次      | 每个发起的操作恰好回调一次；`close()`、`cancel()` 与析构使挂起操作以 `errc::operation_canceled` 完成                          |
+| 并发限制      | 每个 socket 同时最多一个读侧操作（read / accept）和一个写侧操作（connect / write），属于前置条件，不做运行时检查                  |
+| EOF       | 非空缓冲区读到 0 字节报告 `spanio::error::eof`                                                         |
+| 地址复用      | `acceptor::open()`：Linux 设置 `SO_REUSEADDR`（重启服务时可绑定处于 TIME_WAIT 的端口）；Windows 设置 `SO_EXCLUSIVEADDRUSE`。实测 Windows 的 `SO_REUSEADDR` 允许第二个 socket 绑定**正在监听**的端口，有端口劫持风险 |
+| 缓冲区生命周期   | `buffer` 不拥有内存，必须保持有效直到 handler 执行                                                       |
+
+handler 写法（遵循 `code_rule.md`：lambda 先声明为变量再传入）：
 
 ```cpp
-sock.async_read(buf, [](std::error_code ec, std::size_t n) {
-    if (ec) { /* 处理错误 */ return; }
+auto on_read = [&](std::error_code ec, std::size_t n)
+{
+    if (ec)
+    {
+        return; // spanio::error::eof 表示对端已正常关闭
+    }
     // 此时 buf 前 n 字节已是有效数据
-});
+};
+sock.async_read_some(spanio::buffer(buf), on_read);
 ```
 
 ### 6.3 多范式支持
@@ -435,27 +475,75 @@ strand 保证“逻辑单线程、物理多核利用”，是并发安全的核�
 
 参考 `cpp-httplib` 的易用性思路：**不强制继承任何基类，不强制实现大量虚函数**。
 
-一个最小 TCP 回显服务示例（预期写法）：
+一个最小 TCP 回显服务示例（按 v0.5 实现的接口，`examples/echo_server.cpp` 将以此为基础）：
 
 ```cpp
-#include <spanio/spanio.hpp>
+#include <spanio/tcp.h>
 
-int main() {
+#include <array>
+#include <memory>
+
+// 一条连接：读到多少就原样写回多少，直到对端关闭
+class echo_session : public std::enable_shared_from_this<echo_session>
+{
+public:
+    explicit echo_session(spanio::tcp::socket sock)
+        : m_socket(std::move(sock))
+    {
+    }
+
+    void read()
+    {
+        auto self = shared_from_this();
+        auto on_read = [self](std::error_code ec, std::size_t n)
+        {
+            if (ec)
+            {
+                return; // spanio::error::eof：对端关闭；self 释放后 socket 自动关闭
+            }
+            auto on_written = [self](std::error_code write_ec, std::size_t)
+            {
+                if (!write_ec)
+                {
+                    self->read();
+                }
+            };
+            self->m_socket.async_write(spanio::buffer(self->m_buffer.data(), n), on_written);
+        };
+        m_socket.async_read_some(spanio::buffer(m_buffer.data(), m_buffer.size()), on_read);
+    }
+
+private:
+    spanio::tcp::socket m_socket;       // 连接
+    std::array<char, 1024> m_buffer{};  // 接收缓冲区，也是回写的数据源
+};
+
+int main()
+{
     spanio::io_context ctx;
     spanio::tcp::acceptor acc(ctx, spanio::tcp::endpoint(spanio::ipv4::any(), 8080));
 
-    acc.async_accept([&](std::error_code ec, spanio::tcp::socket sock) {
-        auto buf = std::make_shared<std::string>(1024, '\0');
-        sock.async_read(*buf, [&, sock = std::move(sock), buf](std::error_code ec, std::size_t n) mutable {
-            if (ec) return;
-            sock.async_write(std::string_view(*buf).substr(0, n), [](std::error_code, std::size_t) {});
-        });
-    });
+    std::function<void()> accept_next;
+    auto on_accept = [&](std::error_code ec, spanio::tcp::socket sock)
+    {
+        if (!ec)
+        {
+            std::make_shared<echo_session>(std::move(sock))->read();
+        }
+        accept_next();
+    };
+    accept_next = [&]()
+    {
+        acc.async_accept(on_accept);
+    };
+    accept_next();
 
     ctx.run();  // 启动事件循环
     return 0;
 }
 ```
+
+> v0.4 草图中的写法有缺陷：在 `sock` 上发起读操作后又把 `sock` 移动进同一个 lambda 的捕获，操作所在的对象已被移走。上面的写法让 socket 由会话对象持有，handler 通过 `shared_ptr` 保证会话存活到操作完成。
 
 ### 7.3 编译期裁剪
 
@@ -533,9 +621,10 @@ spanio/
 │       ├── io_context.h            # 执行引擎：事件循环、任务队列、executor、work guard（已实现）
 │       ├── executor.h              # 执行器抽象
 │       ├── strand.h                # 串行化域
-│       ├── error.h                 # 统一错误码
-│       ├── buffer.h                # 缓冲区抽象
-│       ├── tcp.h                   # TCP 接口
+│       ├── error.h                 # SpanIO 自有错误码（error::eof）（已实现）
+│       ├── buffer.h                # 缓冲区抽象 mutable_buffer / const_buffer（已实现）
+│       ├── ip.h                    # ip::address、ipv4 / ipv6 常用地址（已实现）
+│       ├── tcp.h                   # TCP 接口：endpoint、socket、acceptor（已实现）
 │       ├── udp.h                   # UDP 接口
 │       ├── timer.h                 # 定时器
 │       ├── resolver.h              # 域名解析

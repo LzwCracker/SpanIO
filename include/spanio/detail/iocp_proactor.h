@@ -40,6 +40,10 @@ constexpr ULONG_PTR kProactorFailedStartKey = 2;
 // Completion key of the wake-up packet queued by interrupt()
 constexpr ULONG_PTR kProactorWakeupKey = 3;
 
+// NTSTATUS left in OVERLAPPED::Internal by a request that was cancelled
+// (STATUS_CANCELLED; ntstatus.h is not included by windows.h)
+constexpr ULONG_PTR kProactorStatusCancelled = 0xC0000120;
+
 // Concurrency value for CreateIoCompletionPort: 0 means "number of CPUs"
 constexpr DWORD kProactorDefaultConcurrency = 0;
 
@@ -459,10 +463,19 @@ private:
         op.m_ec.clear();
         op.m_bytes = bytes;
 
-        // Internal holds the NTSTATUS of the request; WSAGetOverlappedResult
-        // turns a failure into the matching Winsock error (e.g. WSAECONNRESET
-        // instead of ERROR_NETNAME_DELETED), so codes match the reactor path
-        if (op.m_overlapped.Internal != 0)
+        // Internal holds the NTSTATUS of the request. A cancelled request is
+        // recognised directly: the usual sequence is unregister_handle()
+        // (CancelIoEx) followed at once by closesocket(), so by the time the
+        // packet is processed the handle may be closed and
+        // WSAGetOverlappedResult would fail with WSAENOTSOCK instead.
+        if (op.m_overlapped.Internal == kProactorStatusCancelled)
+        {
+            op.m_ec = std::make_error_code(std::errc::operation_canceled);
+        }
+        // Any other failure: WSAGetOverlappedResult turns it into the
+        // matching Winsock error (e.g. WSAECONNRESET instead of
+        // ERROR_NETNAME_DELETED), so codes match the reactor path
+        else if (op.m_overlapped.Internal != 0)
         {
             DWORD transferred = 0;
             DWORD flags = 0;

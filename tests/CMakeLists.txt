@@ -14,6 +14,7 @@ set(SPANIO_TEST_NAMES
     test_io_reactor
     test_io_proactor
     test_io_context
+    test_tcp
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)

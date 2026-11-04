@@ -19,13 +19,17 @@
 #define SPANIO_TESTS_TEST_PROACTOR_BACKENDS_H
 
 #include "spanio/detail/platform_proactor.h"
+#include "spanio/io_context.h"
+#include "test_framework.h"
 
 #if defined(SPANIO_PLATFORM_WINDOWS)
 #include "spanio/detail/iocp_proactor.h"
 #endif
 
 #include <cstdio>
+#include <memory>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace spanio { namespace test {
@@ -68,6 +72,18 @@ inline std::vector<backend_factory> backends()
 inline void announce(const backend_factory& backend)
 {
     std::printf("    [%s]\n", backend.m_label);
+}
+
+// Create an io_context on a given backend or fail the case
+// Parameter backend: which proactor to use
+// Return value: the context, never null
+inline std::unique_ptr<io_context> make_context(const backend_factory& backend)
+{
+    std::error_code ec;
+    detail::io_proactor_ptr proactor = backend.m_create(ec);
+    SPANIO_REQUIRE(!ec);
+    SPANIO_REQUIRE(proactor != nullptr);
+    return std::unique_ptr<io_context>(new io_context(std::move(proactor)));
 }
 
 }}
