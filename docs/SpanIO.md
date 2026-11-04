@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.5（设计草案，按 M1 实现修订）
+> 版本：v0.6（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.6 修订记录（2026-11-05）**：实现 M1 验收示例 `examples/echo_server.cpp`。
+> - 11.2：Windows 单文件编译命令补上 `/EHsc`（实测不加会报 C4530），记录验证情况；Linux 尚未验证。
+> - 十二：M1 标注为“Windows 已完成，Linux 待验证”。
+> - 十：同步工程结构（示例与测试）。
 >
 > **v0.5 修订记录（2026-11-04）**：实现 TCP 接口。
 > - 6.2：按实现重写 `tcp::socket / tcp::acceptor` 接口与约定；`async_read` 改名为 `async_read_some`，新增组合操作 `async_write`；新增 `ip.h`、`buffer.h`、`error.h`。
@@ -644,12 +649,14 @@ spanio/
 │           └── select_reactor.h    # Linux&Windows 通用后端
 │    
 ├── examples/
-│   ├── echo_server.cpp
+│   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
+│   ├── echo_server.cpp         # M1 验收示例：多线程 TCP 回显服务（已实现）
 │   ├── timer_demo.cpp
 │   └── chat_server.cpp
 ├── tests/
 │   ├── test_io_context.cpp
-│   ├── test_tcp.cpp
+│   ├── test_tcp.cpp            # TCP 接口测试（已实现）
+│   ├── test_echo_server.cpp    # 回显示例测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -693,11 +700,18 @@ int main() {
 # Linux
 g++ -std=c++17 -Iinclude examples/echo_server.cpp -o echo_server -lpthread
 
-# Windows (MSVC)
-cl /std:c++17 /Iinclude examples\echo_server.cpp ws2_32.lib
+# Windows (MSVC，在 VS 开发者命令行中)
+cl /std:c++17 /EHsc /Iinclude examples\echo_server.cpp ws2_32.lib
 ```
 
 目标：**同一份示例源码，在两个平台以各自原生命令行直接编译通过**。
+
+v0.6 验证情况：
+
+- Windows：上面的 `cl` 命令（另加 `/W4 /WX`）实测编译通过、无警告。`/EHsc` 是必需的：不加时 MSVC 报 C4530，抛出异常时不会正确析构对象。
+- Linux：尚未验证（开发机没有 Linux 工具链）。
+- CMake 构建时示例作为 `echo_server` 目标编译（`SPANIO_BUILD_EXAMPLES`，顶层项目默认开启），与测试使用相同的严格警告级别。
+- 测试 `tests/test_echo_server.cpp` 以 `SPANIO_ECHO_SERVER_NO_MAIN` 包含示例源码，测试的正是发布的这份代码。
 
 ---
 
@@ -705,7 +719,7 @@ cl /std:c++17 /Iinclude examples\echo_server.cpp ws2_32.lib
 
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
-| M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行 |
+| M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通                   | chat_server 示例     |
 | M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |

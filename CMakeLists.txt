@@ -23,6 +23,7 @@ else()
 endif()
 
 option(SPANIO_BUILD_TESTS "Build the SpanIO unit tests" ${SPANIO_IS_TOP_LEVEL})
+option(SPANIO_BUILD_EXAMPLES "Build the SpanIO example programs" ${SPANIO_IS_TOP_LEVEL})
 
 # Feature switches. Each maps to the macro of the same name and is off by
 # default to keep the core small. Options for SSL, io_uring and coroutines
@@ -67,6 +68,10 @@ if(SPANIO_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+if(SPANIO_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
 # ----------------------------------------------------------------------------
 # IDE support (Visual Studio solution). An INTERFACE library has no project of
 # its own, so these targets exist only to make the headers and docs visible
@@ -92,7 +97,8 @@ if(SPANIO_IS_TOP_LEVEL)
         ${SPANIO_DOC_FILES}
         "${CMAKE_CURRENT_SOURCE_DIR}/CLAUDE.md"
         "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt")
     add_custom_target(spanio_docs SOURCES ${SPANIO_PROJECT_FILES})
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${SPANIO_PROJECT_FILES})
     set_target_properties(spanio_docs PROPERTIES FOLDER "spanio")
