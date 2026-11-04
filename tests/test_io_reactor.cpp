@@ -411,11 +411,12 @@ SPANIO_TEST(reactor_interrupt_wakes_blocked_poll)
     io_reactor_ptr reactor = make_reactor();
     io_reactor& shared = *reactor;
 
-    std::thread helper([&shared]()
+    auto delayed_interrupt = [&shared]()
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
         shared.interrupt();
-    });
+    };
+    std::thread helper(delayed_interrupt);
     event_table out;
     std::error_code ec;
     auto start = std::chrono::steady_clock::now();
@@ -457,11 +458,12 @@ SPANIO_TEST(reactor_cross_thread_mod_wakes_blocked_poll)
     // Written by the helper, read after join(); the check macros are not
     // thread-safe, so the helper never calls them
     std::error_code mod_ec;
-    std::thread helper([&shared, &mod_ec, target]()
+    auto delayed_mod = [&shared, &mod_ec, target]()
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
         mod_ec = shared.mod(target, kEventWrite);
-    });
+    };
+    std::thread helper(delayed_mod);
     const auto start = std::chrono::steady_clock::now();
     const event_mask events = poll_until(*reactor, server.get(), kEventWrite, kEventWaitMs);
     const long long woken_after = elapsed_ms(start);

@@ -119,6 +119,11 @@ Known inconsistencies in the design doc: the umbrella header is called both `spa
 - **Comments:**
   - All comments are in **English**, even though the docs are in Chinese.
   - Comments make up at least 30% of the code, and none of them are filler.
+- **Lambdas:** use as few as possible. When one is needed:
+  - never write it directly in an argument list; declare a named variable (`auto handler = [&]() ...;`) and pass the variable;
+  - its body goes on its own lines inside braces, even if it is a single statement.
+
+  When the lambda captures something whose reference count a test checks (e.g. a `shared_ptr`), pass it with `std::move`, so the named variable does not keep an extra copy.
 - **Logging:** critical paths must log, so that problems can be located quickly.
 
 ## Testing and process rules

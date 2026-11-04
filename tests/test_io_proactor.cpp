@@ -368,11 +368,12 @@ SPANIO_TEST(proactor_post_returns_each_operation_once)
 
         io_proactor& shared = *proactor;
         prepare_post(late_op);
-        std::thread helper([&shared, &late_op]()
+        auto delayed_post = [&shared, &late_op]()
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
             shared.post(&late_op);
-        });
+        };
+        std::thread helper(delayed_post);
         const auto start = test_clock::now();
         const bool woken = wait_one(*proactor, late_op, kCompleteWaitMs);
         const long long waited = elapsed_ms(start);
@@ -772,7 +773,7 @@ SPANIO_TEST(proactor_cross_thread_start_wakes_blocked_poll)
         io_proactor& shared = *proactor;
         const native_handle_t server_handle = server->get();
         const native_handle_t client_handle = client->get();
-        std::thread helper([&shared, &recv_op, &buffer, server_handle, client_handle]()
+        auto delayed_start_and_send = [&shared, &recv_op, &buffer, server_handle, client_handle]()
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
             prepare_recv(recv_op, server_handle, buffer, sizeof(buffer));
@@ -780,7 +781,8 @@ SPANIO_TEST(proactor_cross_thread_start_wakes_blocked_poll)
             // The check macros are not thread-safe; a failed send shows up
             // as a missing or wrong completion in the main thread
             ::send(client_handle, kMessage, static_cast<int>(kMessageLength), kNoFlags);
-        });
+        };
+        std::thread helper(delayed_start_and_send);
         const auto start = test_clock::now();
         const bool completed = wait_one(*proactor, recv_op, kCompleteWaitMs);
         const long long waited = elapsed_ms(start);
@@ -803,11 +805,12 @@ SPANIO_TEST(proactor_interrupt_wakes_blocked_poll)
         io_proactor_ptr proactor = make_proactor(backend);
 
         io_proactor& shared = *proactor;
-        std::thread helper([&shared]()
+        auto delayed_interrupt = [&shared]()
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(kHelperDelayMs));
             shared.interrupt();
-        });
+        };
+        std::thread helper(delayed_interrupt);
         completion_list out;
         std::error_code ec;
         const auto start = test_clock::now();

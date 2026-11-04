@@ -173,25 +173,29 @@ inline void load_nt_function(HMODULE ntdll, const char* name, Fn& out) noexcept
     out = reinterpret_cast<Fn>(reinterpret_cast<void*>(::GetProcAddress(ntdll, name)));
 }
 
+// Resolve the ntdll functions the backend needs
+// Return value: the table; a member is null if the export was not found
+inline nt_api load_nt_api() noexcept
+{
+    nt_api api{};
+    // ntdll.dll is mapped into every Windows process, so it is never null
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (ntdll != nullptr)
+    {
+        load_nt_function(ntdll, "NtCreateFile", api.m_create_file);
+        load_nt_function(ntdll, "NtDeviceIoControlFile", api.m_device_io_control_file);
+        load_nt_function(ntdll, "NtCancelIoFileEx", api.m_cancel_io_file_ex);
+        load_nt_function(ntdll, "RtlNtStatusToDosError", api.m_status_to_dos_error);
+    }
+    return api;
+}
+
 // The process-wide ntdll function table, resolved on first use
 // Return value: the table; a member is null if the export was not found
 inline const nt_api& get_nt_api() noexcept
 {
     // Function-local static: resolved exactly once, thread-safe (C++11)
-    static const nt_api s_api = []()
-    {
-        nt_api api{};
-        // ntdll.dll is mapped into every Windows process, so it is never null
-        const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
-        if (ntdll != nullptr)
-        {
-            load_nt_function(ntdll, "NtCreateFile", api.m_create_file);
-            load_nt_function(ntdll, "NtDeviceIoControlFile", api.m_device_io_control_file);
-            load_nt_function(ntdll, "NtCancelIoFileEx", api.m_cancel_io_file_ex);
-            load_nt_function(ntdll, "RtlNtStatusToDosError", api.m_status_to_dos_error);
-        }
-        return api;
-    }();
+    static const nt_api s_api = load_nt_api();
     return s_api;
 }
 

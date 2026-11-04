@@ -164,11 +164,12 @@ SPANIO_TEST(post_runs_handler_on_run_thread)
     io_context ctx;
     int calls = 0;
     std::thread::id runner;
-    ctx.post([&]
+    auto record_call = [&]()
     {
         ++calls;
         runner = std::this_thread::get_id();
-    });
+    };
+    ctx.post(record_call);
     SPANIO_CHECK(calls == 0);
     SPANIO_CHECK(ctx.run() == 1);
     SPANIO_CHECK(calls == 1);
@@ -182,10 +183,11 @@ SPANIO_TEST(post_preserves_fifo_order)
     std::vector<int> order;
     for (int i = 0; i < kOrderCount; ++i)
     {
-        ctx.post([&order, i]
+        auto record_index = [&order, i]()
         {
             order.push_back(i);
-        });
+        };
+        ctx.post(record_index);
     }
     SPANIO_CHECK(ctx.run() == static_cast<std::size_t>(kOrderCount));
     SPANIO_REQUIRE(order.size() == static_cast<std::size_t>(kOrderCount));
@@ -201,7 +203,7 @@ SPANIO_TEST(handler_can_post_more_work)
     io_context ctx;
     int steps = 0;
     std::function<void()> step;
-    step = [&]
+    step = [&]()
     {
         ++steps;
         if (steps < kChainLength)
@@ -222,12 +224,13 @@ SPANIO_TEST(poll_and_run_one_variants)
     io_context ctx;
     executor_work_guard guard = make_work_guard(ctx);
     int calls = 0;
+    auto count_call = [&]()
+    {
+        ++calls;
+    };
     for (int i = 0; i < kPollBatch; ++i)
     {
-        ctx.post([&]
-        {
-            ++calls;
-        });
+        ctx.post(count_call);
     }
     SPANIO_CHECK(ctx.poll_one() == 1);
     SPANIO_CHECK(calls == 1);
@@ -242,10 +245,7 @@ SPANIO_TEST(poll_and_run_one_variants)
     SPANIO_CHECK(elapsed_ms(start) < kMinWakeMs);
     SPANIO_CHECK(!ctx.stopped());
 
-    ctx.post([&]
-    {
-        ++calls;
-    });
+    ctx.post(count_call);
     SPANIO_CHECK(ctx.run_one() == 1);
     SPANIO_CHECK(calls == kPollBatch + 1);
 
@@ -260,17 +260,19 @@ SPANIO_TEST(stop_from_handler_then_restart)
 {
     io_context ctx;
     int calls = 0;
-    ctx.post([&]
+    auto count_and_stop = [&]()
     {
         ++calls;
         ctx.stop();
-    });
+    };
+    auto count_call = [&]()
+    {
+        ++calls;
+    };
+    ctx.post(count_and_stop);
     for (std::size_t i = 0; i < kAfterStopCount; ++i)
     {
-        ctx.post([&]
-        {
-            ++calls;
-        });
+        ctx.post(count_call);
     }
     SPANIO_CHECK(ctx.run() == 1);
     SPANIO_CHECK(calls == 1);
@@ -291,11 +293,12 @@ SPANIO_TEST(stop_from_other_thread_wakes_run)
 {
     io_context ctx;
     executor_work_guard guard = make_work_guard(ctx);
-    std::thread stopper([&]
+    auto delayed_stop = [&]()
     {
         helper_delay();
         ctx.stop();
-    });
+    };
+    std::thread stopper(delayed_stop);
     const test_clock::time_point start = test_clock::now();
     SPANIO_CHECK(ctx.run() == 0);
     const long long waited = elapsed_ms(start);
@@ -314,17 +317,19 @@ SPANIO_TEST(work_guard_keeps_run_alive)
     SPANIO_CHECK(guard.owns_work());
     std::atomic<int> calls(0);
     std::thread::id runner;
-    std::thread helper([&]
+    auto record_call = [&]()
+    {
+        ++calls;
+        runner = std::this_thread::get_id();
+    };
+    auto post_then_release = [&]()
     {
         helper_delay();
-        ctx.post([&]
-        {
-            ++calls;
-            runner = std::this_thread::get_id();
-        });
+        ctx.post(record_call);
         helper_delay();
         guard.reset();
-    });
+    };
+    std::thread helper(post_then_release);
     const test_clock::time_point start = test_clock::now();
     SPANIO_CHECK(ctx.run() == 1);
     const long long waited = elapsed_ms(start);
@@ -348,27 +353,32 @@ SPANIO_TEST(dispatch_inline_inside_run_posts_outside)
     bool inside_flag = false;
     bool other_thread_flag = true;
 
-    SPANIO_CHECK(!ctx.running_in_this_thread());
-    ctx.dispatch([&]
+    auto mark_outside = [&]()
     {
         outside_ran = true;
-    });
-    SPANIO_CHECK(!outside_ran);
-
-    ctx.post([&]
+    };
+    auto mark_inline = [&]()
+    {
+        inline_ran = true;
+    };
+    auto probe_other_thread = [&]()
+    {
+        other_thread_flag = ctx.running_in_this_thread();
+    };
+    auto dispatch_from_inside = [&]()
     {
         inside_flag = ctx.get_executor().running_in_this_thread();
-        ctx.get_executor().dispatch([&]
-        {
-            inline_ran = true;
-        });
+        ctx.get_executor().dispatch(mark_inline);
         inline_seen_right_after = inline_ran;
-        std::thread other([&]
-        {
-            other_thread_flag = ctx.running_in_this_thread();
-        });
+        std::thread other(probe_other_thread);
         other.join();
-    });
+    };
+
+    SPANIO_CHECK(!ctx.running_in_this_thread());
+    ctx.dispatch(mark_outside);
+    SPANIO_CHECK(!outside_ran);
+
+    ctx.post(dispatch_from_inside);
 
     // The inline dispatch is not a queued handler, so only two are counted
     SPANIO_CHECK(ctx.run() == 2);
@@ -394,28 +404,33 @@ SPANIO_TEST(multi_thread_run_executes_each_once)
     std::atomic<std::size_t> handlers_run(0);
     executor_work_guard guard = make_work_guard(ctx);
 
+    auto run_context = [&]()
+    {
+        handlers_run += ctx.run();
+    };
+    // Posts the handlers of one poster thread; each marks its own slot
+    auto post_batch = [&](int poster)
+    {
+        for (int i = 0; i < kHandlersPerPoster; ++i)
+        {
+            const std::size_t index = static_cast<std::size_t>(poster * kHandlersPerPoster + i);
+            auto mark_hit = [&hits, index]()
+            {
+                ++hits[index];
+            };
+            ctx.post(mark_hit);
+        }
+    };
+
     std::vector<std::thread> runners;
     for (int i = 0; i < kRunThreads; ++i)
     {
-        runners.emplace_back([&]
-        {
-            handlers_run += ctx.run();
-        });
+        runners.emplace_back(run_context);
     }
     std::vector<std::thread> posters;
     for (int p = 0; p < kPostThreads; ++p)
     {
-        posters.emplace_back([&, p]
-        {
-            for (int i = 0; i < kHandlersPerPoster; ++i)
-            {
-                const std::size_t index = static_cast<std::size_t>(p * kHandlersPerPoster + i);
-                ctx.post([&hits, index]
-                {
-                    ++hits[index];
-                });
-            }
-        });
+        posters.emplace_back(post_batch, p);
     }
     for (std::thread& poster : posters)
     {
@@ -446,14 +461,16 @@ SPANIO_TEST(handler_exception_propagates)
 {
     io_context ctx;
     int calls = 0;
-    ctx.post([]
+    auto throw_failure = []()
     {
         throw std::runtime_error("handler failure");
-    });
-    ctx.post([&]
+    };
+    auto count_call = [&]()
     {
         ++calls;
-    });
+    };
+    ctx.post(throw_failure);
+    ctx.post(count_call);
     bool caught = false;
     try
     {
@@ -480,10 +497,12 @@ SPANIO_TEST(destructor_destroys_pending_handlers)
         io_context ctx;
         for (long i = 0; i < kDestroyedHandlers; ++i)
         {
-            ctx.post([token, &called]
+            auto mark_called = [token, &called]()
             {
                 called = true;
-            });
+            };
+            // Moved, so only the queued copy keeps a reference to token
+            ctx.post(std::move(mark_called));
         }
         SPANIO_CHECK(token.use_count() == kSoleOwner + kDestroyedHandlers);
     }
@@ -508,20 +527,22 @@ SPANIO_TEST(io_completion_invokes_handler)
         io_result result{};
         int calls = 0;
         std::thread::id runner;
-        spanio::detail::io_op_base* op = make_io_op([&](const io_result& r)
+        auto record_result = [&](const io_result& r)
         {
             result = r;
             ++calls;
             runner = std::this_thread::get_id();
-        });
-        prepare_recv(*op, server.get(), buffer, sizeof(buffer));
-        ctx->start_io(op);
-
-        std::thread peer([&]
+        };
+        auto delayed_send = [&]()
         {
             helper_delay();
             send_message(client.get());
-        });
+        };
+        spanio::detail::io_op_base* op = make_io_op(record_result);
+        prepare_recv(*op, server.get(), buffer, sizeof(buffer));
+        ctx->start_io(op);
+
+        std::thread peer(delayed_send);
         const test_clock::time_point start = test_clock::now();
         const std::size_t ran = ctx->run();
         const long long waited = elapsed_ms(start);
@@ -556,19 +577,21 @@ SPANIO_TEST(cancel_pending_io_reports_canceled)
         char buffer[kBufferSize] = {};
         io_result result{};
         int calls = 0;
-        spanio::detail::io_op_base* op = make_io_op([&](const io_result& r)
+        const spanio::detail::native_handle_t handle = server.get();
+        io_context& context = *ctx;
+        auto record_result = [&](const io_result& r)
         {
             result = r;
             ++calls;
-        });
-        prepare_recv(*op, server.get(), buffer, sizeof(buffer));
-        ctx->start_io(op);
-        const spanio::detail::native_handle_t handle = server.get();
-        io_context& context = *ctx;
-        ctx->post([&context, handle]
+        };
+        auto cancel_recv = [&context, handle]()
         {
             context.cancel_handle(handle);
-        });
+        };
+        spanio::detail::io_op_base* op = make_io_op(record_result);
+        prepare_recv(*op, server.get(), buffer, sizeof(buffer));
+        ctx->start_io(op);
+        ctx->post(cancel_recv);
 
         const test_clock::time_point start = test_clock::now();
         SPANIO_CHECK(ctx->run() == 2);
@@ -597,10 +620,12 @@ SPANIO_TEST(destructor_drains_canceled_io)
         {
             std::unique_ptr<io_context> ctx = make_context(backend);
             SPANIO_REQUIRE(!ctx->register_handle(server.get()));
-            spanio::detail::io_op_base* op = make_io_op([token, &called](const io_result&)
+            auto mark_called = [token, &called](const io_result&)
             {
                 called = true;
-            });
+            };
+            // Moved, so only the operation keeps a reference to token
+            spanio::detail::io_op_base* op = make_io_op(std::move(mark_called));
             prepare_recv(*op, server.get(), buffer, sizeof(buffer));
             ctx->start_io(op);
             SPANIO_CHECK(token.use_count() == kSoleOwner + 1);

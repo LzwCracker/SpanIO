@@ -115,19 +115,20 @@ SPANIO_TEST(ensure_network_initialized_is_repeatable_and_thread_safe)
 
     // Count failures in the workers; the check macros are not thread-safe
     std::atomic<int> failures(0);
+    auto initialize_repeatedly = [&failures]()
+    {
+        for (int call = 0; call < kInitCallsPerThread; ++call)
+        {
+            if (ensure_network_initialized())
+            {
+                ++failures;
+            }
+        }
+    };
     std::vector<std::thread> threads;
     for (int i = 0; i < kInitThreadCount; ++i)
     {
-        threads.emplace_back([&failures]()
-        {
-            for (int call = 0; call < kInitCallsPerThread; ++call)
-            {
-                if (ensure_network_initialized())
-                {
-                    ++failures;
-                }
-            }
-        });
+        threads.emplace_back(initialize_repeatedly);
     }
     for (std::thread& t : threads)
     {
