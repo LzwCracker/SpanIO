@@ -37,9 +37,12 @@ using spanio::detail::native_handle_t;
 using spanio::test::announce;
 using spanio::test::backend_factory;
 using spanio::test::backends;
+using spanio::test::connect_client;
 using spanio::test::connect_to;
 using spanio::test::loopback_address;
 using spanio::test::make_context;
+using spanio::test::recv_exact;
+using spanio::test::send_all;
 using spanio::test::socket_guard;
 
 namespace {
@@ -80,16 +83,6 @@ constexpr char kHello[] = "hello, echo";
 // Length of kHello without the terminating zero
 constexpr std::size_t kHelloLength = sizeof(kHello) - 1;
 
-// Receive timeout of the blocking clients, so a server bug fails the case
-// instead of hanging it
-constexpr int kReceiveTimeoutMs = 5000;
-
-// Milliseconds per second, for the Linux SO_RCVTIMEO timeval
-constexpr int kMillisPerSecond = 1000;
-
-// Microseconds per millisecond, for the Linux SO_RCVTIMEO timeval
-constexpr int kMicrosPerMilli = 1000;
-
 // Longest wait for the server's session count to change
 constexpr int kSessionWaitMs = 5000;
 
@@ -99,12 +92,6 @@ constexpr int kPollIntervalMs = 5;
 // Upper bound for run() to return after stop(); covers Windows' ~2 s
 // refused-connect retries
 constexpr long long kStopLimitMs = 5000;
-
-// recv/send flags for the blocking clients: none
-constexpr int kNoFlags = 0;
-
-// recv/send result that means the connection is closed
-constexpr int kConnectionClosed = 0;
 
 // Port given on the command line in the argument case ("9000")
 constexpr std::uint16_t kExplicitPort = 9000;
@@ -143,79 +130,6 @@ char message_byte(int client, int message, std::size_t index)
     const std::size_t value = static_cast<std::size_t>(client) * kClientStride
                             + static_cast<std::size_t>(message) * kMessageStride + index;
     return static_cast<char>(value % kPatternModulo);
-}
-
-// Give a blocking socket a receive timeout
-// Parameter handle: socket to configure
-// Return value: true on success
-bool set_receive_timeout(native_handle_t handle)
-{
-#if defined(SPANIO_PLATFORM_WINDOWS)
-    const DWORD timeout = kReceiveTimeoutMs;
-#else
-    timeval timeout{};
-    timeout.tv_sec = kReceiveTimeoutMs / kMillisPerSecond;
-    timeout.tv_usec = (kReceiveTimeoutMs % kMillisPerSecond) * kMicrosPerMilli;
-#endif
-    return ::setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
-                        static_cast<spanio::detail::socklen_type>(sizeof(timeout)))
-        != spanio::detail::kSocketCallFailed;
-}
-
-// Open a blocking client connected to the server on 127.0.0.1
-// Parameter port:   server port
-// Parameter client: receives the connected socket
-// Return value: true on success; never calls the check macros, so it is
-//               safe in helper threads
-bool connect_client(std::uint16_t port, socket_guard& client)
-{
-    std::error_code ec;
-    client.reset(spanio::detail::create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, ec));
-    if (ec)
-    {
-        return false;
-    }
-    return set_receive_timeout(client.get()) && connect_to(client.get(), loopback_address(port)) == 0;
-}
-
-// Send a whole buffer on a blocking socket
-// Parameter handle: connected socket
-// Parameter data:   bytes to send
-// Parameter size:   number of bytes
-// Return value: true if every byte was sent
-bool send_all(native_handle_t handle, const char* data, std::size_t size)
-{
-    std::size_t sent = 0;
-    while (sent < size)
-    {
-        const int result = ::send(handle, data + sent, static_cast<int>(size - sent), kNoFlags);
-        if (result <= kConnectionClosed)
-        {
-            return false;
-        }
-        sent += static_cast<std::size_t>(result);
-    }
-    return true;
-}
-
-// Receive exactly a number of bytes on a blocking socket
-// Parameter handle: connected socket
-// Parameter data:   destination
-// Parameter size:   number of bytes to receive
-// Return value: true if all of them arrived before a close, error or timeout
-bool recv_exact(native_handle_t handle, char* data, std::size_t size)
-{
-    std::size_t received = 0;
-    while (received < size)
-    {
-        const int result = ::recv(handle, data + received, static_cast<int>(size - received), kNoFlags);
-        if (result <= kConnectionClosed)
-        {
-            return false;
-        }
-        received += static_cast<std::size_t>(result);
-    }
-    return true;
 }
 
 // Wait until the server serves a given number of sessions

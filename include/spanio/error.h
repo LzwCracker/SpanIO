@@ -28,7 +28,17 @@ enum misc_errors
 {
     // The peer closed the connection in an orderly way: a read completed
     // with 0 bytes although the buffer was not empty
-    eof = 1
+    eof = 1,
+    // tcp_server: a message, or the input buffered while waiting for one,
+    // exceeded tcp_server_options::m_max_message_size
+    message_too_large,
+    // tcp_server: queued output exceeded
+    // tcp_server_options::m_max_send_queue_bytes
+    send_queue_full,
+    // tcp_server: the framer reported malformed input
+    framing_error,
+    // tcp_server: a user callback threw an exception
+    handler_failed
 };
 
 // Category of misc_errors
@@ -47,11 +57,21 @@ public:
     // Return value: description text
     std::string message(int value) const override
     {
-        if (value == eof)
+        switch (value)
         {
+        case eof:
             return "End of file";
+        case message_too_large:
+            return "Message too large";
+        case send_queue_full:
+            return "Send queue full";
+        case framing_error:
+            return "Malformed message framing";
+        case handler_failed:
+            return "User callback failed";
+        default:
+            return "spanio.misc error";
         }
-        return "spanio.misc error";
     }
 };
 

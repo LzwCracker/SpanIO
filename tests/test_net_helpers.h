@@ -14,6 +14,7 @@
 #include "spanio/detail/socket_ops.h"
 #include "test_framework.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace spanio { namespace test {
@@ -23,6 +24,21 @@ constexpr std::uint16_t kAnyPort = 0;
 
 // Backlog for test listeners; each listener serves a single connection
 constexpr int kListenBacklog = 1;
+
+// Receive timeout of blocking test clients
+constexpr int kClientReceiveTimeoutMs = 5000;
+
+// Milliseconds per second, for the Linux SO_RCVTIMEO timeval
+constexpr int kMillisPerSecond = 1000;
+
+// Microseconds per millisecond, for the Linux SO_RCVTIMEO timeval
+constexpr int kMicrosPerMilli = 1000;
+
+// recv/send flags of blocking test clients: none
+constexpr int kNoSocketFlags = 0;
+
+// recv/send result at or below which the connection is closed or failed
+constexpr int kSocketClosedResult = 0;
 
 // Owns a socket handle and closes it when the scope ends, so a failed
 // SPANIO_REQUIRE does not leak the handle
@@ -142,6 +158,81 @@ inline void make_tcp_pair(socket_guard& client, socket_guard& server)
     SPANIO_REQUIRE(connect_to(client.get(), addr) != detail::kSocketCallFailed);
     server.reset(::accept(listener.get(), nullptr, nullptr));
     SPANIO_REQUIRE(server.get() != detail::kInvalidHandle);
+}
+
+// Give a blocking socket a receive timeout, so a server bug fails a case
+// instead of hanging it
+// Parameter handle: socket to configure
+// Return value: true on success
+inline bool set_receive_timeout(detail::native_handle_t handle)
+{
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    const DWORD timeout = kClientReceiveTimeoutMs;
+#else
+    timeval timeout{};
+    timeout.tv_sec = kClientReceiveTimeoutMs / kMillisPerSecond;
+    timeout.tv_usec = (kClientReceiveTimeoutMs % kMillisPerSecond) * kMicrosPerMilli;
+#endif
+    return ::setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
+                        static_cast<detail::socklen_type>(sizeof(timeout)))
+        != detail::kSocketCallFailed;
+}
+
+// Open a blocking client connected to a server on 127.0.0.1
+// Parameter port:   server port
+// Parameter client: receives the connected socket
+// Return value: true on success; it uses no check macros, so it is safe in
+//               helper threads
+inline bool connect_client(std::uint16_t port, socket_guard& client)
+{
+    std::error_code ec;
+    client.reset(detail::create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, ec));
+    if (ec)
+    {
+        return false;
+    }
+    return set_receive_timeout(client.get()) && connect_to(client.get(), loopback_address(port)) == 0;
+}
+
+// Send a whole buffer on a blocking socket
+// Parameter handle: connected socket
+// Parameter data:   bytes to send
+// Parameter size:   number of bytes
+// Return value: true if every byte was sent
+inline bool send_all(detail::native_handle_t handle, const char* data, std::size_t size)
+{
+    std::size_t sent = 0;
+    while (sent < size)
+    {
+        const int result = ::send(handle, data + sent, static_cast<int>(size - sent), kNoSocketFlags);
+        if (result <= kSocketClosedResult)
+        {
+            return false;
+        }
+        sent += static_cast<std::size_t>(result);
+    }
+    return true;
+}
+
+// Receive exactly a number of bytes on a blocking socket
+// Parameter handle: connected socket
+// Parameter data:   destination
+// Parameter size:   number of bytes to receive
+// Return value: true if all of them arrived before a close, error or timeout
+inline bool recv_exact(detail::native_handle_t handle, char* data, std::size_t size)
+{
+    std::size_t received = 0;
+    while (received < size)
+    {
+        const int result = ::recv(handle, data + received, static_cast<int>(size - received),
+                                  kNoSocketFlags);
+        if (result <= kSocketClosedResult)
+        {
+            return false;
+        }
+        received += static_cast<std::size_t>(result);
+    }
+    return true;
 }
 
 }}

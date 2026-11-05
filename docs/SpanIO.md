@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.6（设计草案，按 M1 实现修订）
+> 版本：v0.7（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.7 修订记录（2026-11-05）**：增加高层服务端封装 `tcp_server`。
+> - 新增 6.5：`tcp_server`、`tcp_connection`、`tcp_server_options` 与 `framing.h` 的接口、约定和限制。
+> - 新增错误码 `error::message_too_large / send_queue_full / framing_error / handler_failed`。
+> - 十二：M2 的 `chat_server` 改为基于 `tcp_server` 实现；`udp_server` 在 `udp::socket` 之后实现。
+> - 十：同步工程结构。
 >
 > **v0.6 修订记录（2026-11-05）**：实现 M1 验收示例 `examples/echo_server.cpp`。
 > - 11.2：Windows 单文件编译命令补上 `/EHsc`（实测不加会报 C4530），记录验证情况；Linux 尚未验证。
@@ -469,6 +475,46 @@ strand 保证“逻辑单线程、物理多核利用”，是并发安全的核�
 
 ---
 
+### 6.5 高层服务端封装 tcp_server（v0.7）
+
+`tcp::socket / acceptor` 要求使用者自己处理接受循环、连接生命周期、写操作串行和分帧。`tcp_server`（`tcp_server.h`）把这些收拢起来，服务只需提供回调；低层接口继续保留。
+
+```cpp
+spanio::tcp_server server(8080);
+auto on_message = [](const spanio::tcp_connection_ptr& conn, std::string_view data)
+{
+    conn->send(data);
+};
+server.on_message(on_message);
+server.run(4);                   // 阻塞到 stop()，共 4 个线程
+```
+
+| 组成                     | 内容                                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `tcp_server`           | 构造时完成绑定和监听，失败抛异常。`on_connect / on_message / on_close / set_framer` 须在启动前设置。`start()` 不阻塞，`run(n)` 阻塞且只能用于自带 context，`stop()` 可在任意线程调用 |
+| `tcp_connection`       | 由 `shared_ptr` 持有。`send()` 可在任意线程调用，内部排队；`close()` 发完再关，`abort()` 立即关；`context()` 用 `std::any` 挂业务数据 |
+| `tcp_server_options`   | 最大连接数、最大消息长度、发送队列字节上限、读缓冲大小                                                                        |
+| 分帧（`framing.h`）        | `line_framer()`、`length_prefix_framer()`、`encode_length_prefixed()`，也可传入任意函数对象                         |
+
+约定：
+
+| 约定      | 内容                                                                                                                          |
+| ------- | --------------------------------------------------------------------------------------------------------------------------- |
+| 回调顺序    | `on_connect` 返回后才开始读；`on_close` 恰好一次且在最后                                                                                     |
+| 回调并发    | 同一连接的回调不并发；不同连接之间可能并发，共享数据要自己加锁，`run(1)` 除外                                                                                  |
+| 实现方式    | 每条连接有一条持续的读链，**所有回调都从读链发出**，写操作独立进行且不调用用户代码。读链结束且没有写操作在途时才触发 `on_close`                                                     |
+| 关闭原因    | `on_close` 的 `ec`：本端 `close()/abort()/stop()` 为空，对端关闭为 `error::eof`，超限或回调异常为 `error::message_too_large / send_queue_full / framing_error / handler_failed`，其余为系统错误码 |
+| 半关闭     | 对端只关闭发送方向（EOF）时，已排队的数据仍会发完再关闭，`ec` 为 `error::eof`                                                                           |
+| 回调异常    | `on_connect / on_message` 抛异常时记录日志并关闭该连接，服务继续运行；`on_close` 的异常只记录                                                             |
+| 超过最大连接数 | 接受后立即关闭，不调用 `on_connect`（暂停接受会让客户端连上却没有响应，更难排查）                                                                               |
+| 写操作     | 不用 `async_write`，而是在连接锁内逐次 `async_write_some`：部分发送后继续时不能落到别的线程刚关闭的 socket 上。在途的队首数据等写操作返回后才释放                                  |
+| 内存安全    | 注册表持有 `weak_ptr`，连接持有共享状态，避免循环引用；外部 context 上 server 销毁后才运行的 handler 也是安全的                                                     |
+
+限制：
+
+- `stop()` 立即关闭并丢弃未发送的数据。优雅关闭需要超时，要等 M3 的 `timer`；同样的原因，`close()` 遇到不读数据的对端时会一直等待，直到 `abort()` 或 `stop()`。空闲超时也在 M3 之后补充。
+- 一个 `tcp_server` 只能启动一次；`tcp_connection_ptr` 不能比 `tcp_server` 活得更久。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -630,6 +676,8 @@ spanio/
 │       ├── buffer.h                # 缓冲区抽象 mutable_buffer / const_buffer（已实现）
 │       ├── ip.h                    # ip::address、ipv4 / ipv6 常用地址（已实现）
 │       ├── tcp.h                   # TCP 接口：endpoint、socket、acceptor（已实现）
+│       ├── tcp_server.h            # 高层 TCP 服务端：tcp_server、tcp_connection（已实现）
+│       ├── framing.h               # 消息分帧：按行、长度前缀（已实现）
 │       ├── udp.h                   # UDP 接口
 │       ├── timer.h                 # 定时器
 │       ├── resolver.h              # 域名解析
@@ -657,6 +705,7 @@ spanio/
 │   ├── test_io_context.cpp
 │   ├── test_tcp.cpp            # TCP 接口测试（已实现）
 │   ├── test_echo_server.cpp    # 回显示例测试（已实现）
+│   ├── test_tcp_server.cpp     # tcp_server 与分帧测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -720,7 +769,7 @@ v0.6 验证情况：
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
-| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通                   | chat_server 示例     |
+| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server 已完成，udp_server 待做 |
 | M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
