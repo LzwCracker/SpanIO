@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.7（设计草案，按 M1 实现修订）
+> 版本：v0.8（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.8 修订记录（2026-11-06）**：实现 M2 示例 `examples/chat_server.cpp`。
+> - 6.5：增加基于 `tcp_server` 的 `chat_server` 示例说明。
+> - 十 / 十二：同步工程结构，M2 进度更新。
 >
 > **v0.7 修订记录（2026-11-05）**：增加高层服务端封装 `tcp_server`。
 > - 新增 6.5：`tcp_server`、`tcp_connection`、`tcp_server_options` 与 `framing.h` 的接口、约定和限制。
@@ -515,6 +519,13 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 - `stop()` 立即关闭并丢弃未发送的数据。优雅关闭需要超时，要等 M3 的 `timer`；同样的原因，`close()` 遇到不读数据的对端时会一直等待，直到 `abort()` 或 `stop()`。空闲超时也在 M3 之后补充。
 - 一个 `tcp_server` 只能启动一次；`tcp_connection_ptr` 不能比 `tcp_server` 活得更久。
 
+示例 `examples/chat_server.cpp`（`chat_server [port] [threads]`，默认端口 9000）演示了在 `tcp_server` 上写一个完整服务：
+
+- **协议：** 文本行，第一行是昵称（非空、最长 32 字节、不与在线用户重复），之后每行以 `昵称: 内容` 广播给其他人；进出时广播 `* 昵称 joined / left`，加入成功回 `* welcome 昵称`，失败回 `error: 原因` 并断开。
+- **结构：** 示例只包含聊天逻辑。连接、分帧、发送队列和线程全部由 `tcp_server` 负责，一条超过 1024 字节的行或落后超过 1 MiB 的客户端由 `tcp_server_options` 的上限断开。
+- **全局顺序：** `chat_room` 持锁广播，所有用户看到的消息顺序一致。`send()` 只是入队，持锁成本很低。
+- **避免循环引用：** 成员表持有 `weak_ptr`，因为回调持有房间，而连接持有服务端状态，强引用会形成环。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -700,12 +711,13 @@ spanio/
 │   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
 │   ├── echo_server.cpp         # M1 验收示例：多线程 TCP 回显服务（已实现）
 │   ├── timer_demo.cpp
-│   └── chat_server.cpp
+│   └── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 ├── tests/
 │   ├── test_io_context.cpp
 │   ├── test_tcp.cpp            # TCP 接口测试（已实现）
 │   ├── test_echo_server.cpp    # 回显示例测试（已实现）
 │   ├── test_tcp_server.cpp     # tcp_server 与分帧测试（已实现）
+│   ├── test_chat_server.cpp    # 聊天示例测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -769,7 +781,7 @@ v0.6 验证情况：
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
-| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server 已完成，udp_server 待做 |
+| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server 与 chat_server 已完成，udp::socket 与 udp_server 待做 |
 | M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
