@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.10（设计草案，按 M1 实现修订）
+> 版本：v0.11（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.11 修订记录（2026-11-06）**：增加高层服务端封装 `udp_server`，M2 在 Windows 上完成。
+> - 新增 6.7：`udp_server`、`udp_server_options`、`udp_server_stats` 的接口、约定和限制；示例 `examples/udp_echo_server.cpp`。
+> - 十 / 十二：同步工程结构；M2 标注为“Windows 已完成，Linux 待验证”。
 >
 > **v0.10 修订记录（2026-11-06）**：实现 `udp::socket`。
 > - 新增 6.6：`udp::socket` 的接口、约定和平台差异。
@@ -584,6 +588,37 @@ public:
 
 本期不做 `connect` 模式的 UDP、组播和广播选项，需要时通过 `native_handle()` 设置。
 
+### 6.7 高层服务端封装 udp_server（v0.11）
+
+`udp_server`（`udp_server.h`）对应 6.5 的 `tcp_server`，由它负责接收循环、发送队列和线程，服务只需提供一个回调。低层的 `udp::socket` 继续保留。
+
+```cpp
+spanio::udp_server server(9000);
+auto on_datagram = [&server](const spanio::udp::endpoint& from, std::string_view data)
+{
+    server.send_to(from, data);
+};
+server.on_datagram(on_datagram);
+server.run();                    // 阻塞到 stop()
+```
+
+| 约定      | 内容                                                                                           |
+| ------- | -------------------------------------------------------------------------------------------- |
+| 回调并发    | 只有一条接收链，`on_datagram` **始终串行**，处理完一个才收下一个。回调要短，否则内核队列满后会丢包；`run(n)` 的 `n > 1` 对此没有帮助，耗时工作应分发给其他线程 |
+| 数据有效期   | `from` 和 `data` 只在回调期间有效；空数据报正常投递                                                             |
+| 发送      | `send_to()` 可在任意线程调用，入队后逐个发送，同一线程的顺序不变                                                        |
+| 队列满     | 丢弃新数据报，`send_to()` 返回 `false`，计入 `m_queue_dropped`。UDP 没有连接可断，也不影响已入队的数据                      |
+| 发送失败    | 记录日志并计入 `m_send_failed`，不提供错误回调                                                               |
+| 超长数据报   | 超过 `m_max_datagram_size` 时丢弃并计入 `m_truncated`，不调用回调，避免业务处理残缺数据                                  |
+| 错误处理    | 回调异常和接收错误都只记录日志，继续接收，只有 `stop()` 才结束                                                         |
+| 生命周期    | 与 `tcp_server` 相同：构造时绑定，回调在启动前设置，只能启动一次，`run()` 只用于自带 context                                 |
+
+限制：`stop()` 立即停止并丢弃未发送的数据，优雅关闭要等 M3 的 `timer`。
+
+`stats()` 返回 `udp_server_stats`，包含 `m_received / m_sent / m_queue_dropped / m_send_failed / m_truncated`。
+
+示例 `examples/udp_echo_server.cpp`（`udp_echo_server [port]`，默认端口 9000）基于 `udp_server` 实现。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -748,12 +783,14 @@ spanio/
 │       ├── tcp_server.h            # 高层 TCP 服务端：tcp_server、tcp_connection（已实现）
 │       ├── framing.h               # 消息分帧：按行、长度前缀（已实现）
 │       ├── udp.h                   # UDP 接口：udp::socket（已实现）
+│       ├── udp_server.h            # 高层 UDP 服务端：udp_server（已实现）
 │       ├── timer.h                 # 定时器
 │       ├── resolver.h              # 域名解析
 │       └── detail/
 │           ├── platform.h          # 平台宏与类型别名（已实现）
 │           ├── socket_ops.h        # socket 生命周期封装（已实现）
 │           ├── socket_common.h     # tcp.h 与 udp.h 共用的辅助代码（已实现）
+│           ├── run_threads.h       # 在多个线程上运行 io_context（已实现）
 │           ├── io_reactor.h        # 就绪通知抽象接口与事件定义（已实现）
 │           ├── platform_reactor.h  # 按平台选择默认后端（已实现）
 │           ├── epoll_reactor.h     # Linux epoll 后端，水平触发（已实现）
@@ -770,7 +807,8 @@ spanio/
 │   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
 │   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务（已实现）
 │   ├── timer_demo.cpp
-│   └── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
+│   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
+│   └── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
 ├── tests/
 │   ├── test_io_context.cpp
 │   ├── test_tcp.cpp            # TCP 接口测试（已实现）
@@ -778,6 +816,7 @@ spanio/
 │   ├── test_tcp_server.cpp     # tcp_server 与分帧测试（已实现）
 │   ├── test_chat_server.cpp    # 聊天示例测试（已实现）
 │   ├── test_udp.cpp            # udp::socket 测试（已实现）
+│   ├── test_udp_server.cpp     # udp_server 与 UDP 回显示例测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -841,7 +880,7 @@ v0.6 验证情况：
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
-| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server、chat_server、udp::socket 已完成，udp_server 待做 |
+| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**Windows 已完成**；**Linux 待验证**） |
 | M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |

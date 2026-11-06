@@ -13,6 +13,7 @@
 set(SPANIO_EXAMPLE_NAMES
     echo_server
     chat_server
+    udp_echo_server
 )
 
 foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)

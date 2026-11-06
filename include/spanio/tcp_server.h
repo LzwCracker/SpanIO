@@ -57,12 +57,12 @@
 #include "spanio/ip.h"
 #include "spanio/tcp.h"
 #include "spanio/detail/platform.h"
+#include "spanio/detail/run_threads.h"
 
 #include <any>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -70,7 +70,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -987,40 +986,7 @@ public:
         }
         m_state->ensure_started();
 
-        // The first failure stops the others and is rethrown after they end
-        std::mutex failure_mutex;
-        std::exception_ptr failure;
-        io_context& context = *m_owned_context;
-        auto run_context = [&context, &failure_mutex, &failure]()
-        {
-            try
-            {
-                context.run();
-            }
-            catch (...)
-            {
-                std::lock_guard<std::mutex> lock(failure_mutex);
-                if (failure == nullptr)
-                {
-                    failure = std::current_exception();
-                }
-                context.stop();
-            }
-        };
-        std::vector<std::thread> workers;
-        for (unsigned i = 1; i < threads; ++i)
-        {
-            workers.emplace_back(run_context);
-        }
-        run_context();
-        for (std::thread& worker : workers)
-        {
-            worker.join();
-        }
-        if (failure != nullptr)
-        {
-            std::rethrow_exception(failure);
-        }
+        detail::run_on_threads(*m_owned_context, threads);
     }
 
     // Stop accepting and close every connection at once, dropping unsent
