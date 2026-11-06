@@ -136,7 +136,7 @@ char message_byte(int client, int message, std::size_t index)
 // Parameter server:   server to watch
 // Parameter expected: session count to wait for
 // Return value: true if the count was reached within kSessionWaitMs
-bool wait_for_sessions(const echo::echo_server& server, int expected)
+bool wait_for_sessions(const echo::echo_server& server, std::size_t expected)
 {
     const test_clock::time_point start = test_clock::now();
     while (server.active_sessions() != expected)
@@ -194,8 +194,8 @@ public:
     server_runner(const server_runner&) = delete;
     server_runner& operator=(const server_runner&) = delete;
 
-    // Stop accepting and wait for every run() to return. run() returns once
-    // the remaining sessions have ended, so clients must be closed first.
+    // Stop the server, which disconnects any clients still connected, and
+    // wait for every run() to return
     void stop_and_join()
     {
         m_server->stop();

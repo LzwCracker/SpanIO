@@ -1,14 +1,17 @@
 // ============================================================================
 // File purpose: TCP echo server, the end-to-end example of SpanIO M1. Every
-//               connection gets an echo_session that reads whatever arrives
-//               and writes exactly those bytes back, until the client
-//               disconnects. Several threads can run the io_context at once.
+//               connection gets back exactly the bytes it sends. It is built
+//               on tcp_server, which owns the connections, send queues and
+//               threads, so the service itself is one callback.
 // Usage:        echo_server [port] [threads]
 //                 port     listening port, 1-65535 (default 8080)
-//                 threads  threads calling io_context::run(), 1-256
+//                 threads  threads running the server, 1-256
 //                          (default: number of CPU cores)
 //               The server listens on 0.0.0.0 and runs until the process is
 //               killed; Ctrl+C handling needs a signal wrapper (planned).
+//               A client that sends far more than it reads back is
+//               disconnected once 16 MiB of echoes are queued for it (the
+//               tcp_server default).
 //
 //               Single-file build, from the repository root:
 //                 Linux:   g++ -std=c++17 -Iinclude examples/echo_server.cpp -o echo_server -lpthread
@@ -23,24 +26,19 @@
 // Date:         2026-11-05
 // ============================================================================
 
-#include "spanio/io_context.h"
-#include "spanio/tcp.h"
+#include "spanio/tcp_server.h"
 
-#include <array>
-#include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <memory>
-#include <mutex>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
-#include <utility>
-#include <vector>
 
 namespace echo {
 
@@ -74,9 +72,6 @@ constexpr int kThreadsArgument = 2;
 // Numbers on the command line are decimal
 constexpr int kDecimalBase = 10;
 
-// Bytes each session reads at a time
-constexpr std::size_t kSessionBufferSize = 4096;
-
 // Process exit code: normal end
 constexpr int kExitSuccess = 0;
 
@@ -91,7 +86,7 @@ struct options
 {
     // Port to listen on
     std::uint16_t m_port = kDefaultPort;
-    // Threads that call io_context::run()
+    // Threads running the server
     unsigned m_threads = kFallbackThreads;
 };
 
@@ -166,132 +161,48 @@ inline bool parse_arguments(int argc, const char* const* argv, options& out, std
     return true;
 }
 
-// Number of live sessions, shared between the server and its sessions. It
-// is held through a shared_ptr because sessions can outlive the server
-// object (their handlers may still be queued in the io_context).
-using session_counter = std::shared_ptr<std::atomic<int>>;
 
-// One client connection: reads whatever arrives and writes it back, until
-// the client disconnects or an error occurs. It is kept alive by the
-// shared_ptr each pending handler holds, and closes its socket when the
-// last one is gone.
-class echo_session : public std::enable_shared_from_this<echo_session>
-{
-public:
-    // Parameter socket: the accepted connection
-    // Parameter active: live-session counter, incremented here and
-    //                   decremented by the destructor
-    echo_session(spanio::tcp::socket socket, session_counter active)
-        : m_socket(std::move(socket))
-        , m_active(std::move(active))
-        , m_buffer{}
-    {
-        ++*m_active;
-    }
-
-    // Closes the connection (through the socket's destructor)
-    ~echo_session()
-    {
-        --*m_active;
-    }
-
-    echo_session(const echo_session&) = delete;
-    echo_session& operator=(const echo_session&) = delete;
-
-    // Start echoing
-    void start()
-    {
-        read();
-    }
-
-private:
-    // Read the next piece of data
-    void read()
-    {
-        std::shared_ptr<echo_session> self = shared_from_this();
-        auto read_done = [self](std::error_code ec, std::size_t bytes)
-        {
-            self->on_read(ec, bytes);
-        };
-        m_socket.async_read_some(spanio::buffer(m_buffer.data(), m_buffer.size()), read_done);
-    }
-
-    // Write a piece back, or end the session
-    // Parameter ec:    read result; spanio::error::eof when the client closed
-    // Parameter bytes: bytes read into m_buffer
-    void on_read(std::error_code ec, std::size_t bytes)
-    {
-        if (ec)
-        {
-            if (ec != spanio::error::eof && ec != std::errc::operation_canceled)
-            {
-                std::fprintf(stderr, "echo_server: read failed: %s\n", ec.message().c_str());
-            }
-            return;
-        }
-        std::shared_ptr<echo_session> self = shared_from_this();
-        auto write_done = [self](std::error_code write_ec, std::size_t)
-        {
-            self->on_written(write_ec);
-        };
-        m_socket.async_write(spanio::buffer(m_buffer.data(), bytes), write_done);
-    }
-
-    // Continue with the next read once the echo was sent
-    // Parameter ec: write result
-    void on_written(std::error_code ec)
-    {
-        if (ec)
-        {
-            if (ec != std::errc::operation_canceled)
-            {
-                std::fprintf(stderr, "echo_server: write failed: %s\n", ec.message().c_str());
-            }
-            return;
-        }
-        read();
-    }
-
-    // The client connection
-    spanio::tcp::socket m_socket;
-    // Live-session counter shared with the server
-    session_counter m_active;
-    // Data read from the client, written back unchanged
-    std::array<char, kSessionBufferSize> m_buffer;
-};
-
-// Accepts connections and starts an echo_session for each. The acceptor is
-// guarded by a mutex because stop() may be called from any thread while an
-// accept handler re-arms the acceptor on a run() thread.
+// The echo service: a tcp_server whose only callback sends received bytes
+// back. No framer is set, so each read is echoed as it arrives.
 class echo_server
 {
 public:
-    // Open, bind and listen; throws std::system_error on failure
-    // Parameter context: context that runs the server; must outlive it
+    // Listen on 0.0.0.0 on a context owned by the server. Throws
+    // std::system_error if the port cannot be bound.
+    // Parameter port: port to listen on
+    explicit echo_server(std::uint16_t port)
+        : m_server(port)
+    {
+        m_server.on_message(&echo_server::on_message);
+    }
+
+    // Listen on an address, on a context the caller runs; use start(), not
+    // run(). Throws std::system_error if the address cannot be bound.
+    // Parameter context: context to run on; must outlive the server
     // Parameter local:   address and port to listen on; port 0 picks one
     echo_server(spanio::io_context& context, const spanio::tcp::endpoint& local)
-        : m_acceptor(context, local)
-        , m_active(std::make_shared<std::atomic<int>>(0))
+        : m_server(context, local)
     {
+        m_server.on_message(&echo_server::on_message);
     }
 
-    echo_server(const echo_server&) = delete;
-    echo_server& operator=(const echo_server&) = delete;
-
-    // Start accepting connections
+    // Start accepting, without blocking
     void start()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        accept_next_locked();
+        m_server.start();
     }
 
-    // Stop accepting: closes the acceptor, so new connections are refused.
-    // Sessions already running continue until their clients disconnect.
-    // Safe from any thread.
+    // Run on the owned context until stop()
+    // Parameter threads: threads to run on, including the calling one
+    void run(unsigned threads)
+    {
+        m_server.run(threads);
+    }
+
+    // Disconnect every client and stop accepting; safe from any thread
     void stop()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_acceptor.close();
+        m_server.stop();
     }
 
     // Address the server listens on, e.g. to learn the port picked for 0
@@ -299,69 +210,41 @@ public:
     // Return value: the endpoint
     spanio::tcp::endpoint local_endpoint(std::error_code& ec) const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_acceptor.local_endpoint(ec);
+        return m_server.local_endpoint(ec);
     }
 
     // Number of client connections currently being served
-    // Return value: live sessions
-    int active_sessions() const
+    // Return value: live connections
+    std::size_t active_sessions() const
     {
-        return m_active->load();
+        return m_server.connection_count();
+    }
+
+    // Name of the I/O backend, for the startup message
+    // Return value: static string
+    const char* backend_name()
+    {
+        return m_server.context().backend_name();
     }
 
 private:
-    // Start the next accept, unless the server was stopped. Caller holds
-    // m_mutex.
-    void accept_next_locked()
+    // Send received bytes back
+    // Parameter connection: the client
+    // Parameter data:       the bytes, valid during this call; send() copies
+    static void on_message(const spanio::tcp_connection_ptr& connection, std::string_view data)
     {
-        if (!m_acceptor.is_open())
-        {
-            return;
-        }
-        auto accept_done = [this](std::error_code ec, spanio::tcp::socket peer)
-        {
-            this->on_accept(ec, std::move(peer));
-        };
-        m_acceptor.async_accept(accept_done);
+        connection->send(data);
     }
 
-    // Start a session for a new connection and accept the next one
-    // Parameter ec:   accept result
-    // Parameter peer: the new connection on success
-    void on_accept(std::error_code ec, spanio::tcp::socket peer)
-    {
-        if (ec == std::errc::operation_canceled)
-        {
-            // stop() closed the acceptor
-            return;
-        }
-        if (ec)
-        {
-            std::fprintf(stderr, "echo_server: accept failed: %s\n", ec.message().c_str());
-        }
-        else
-        {
-            std::make_shared<echo_session>(std::move(peer), m_active)->start();
-        }
-        std::lock_guard<std::mutex> lock(m_mutex);
-        accept_next_locked();
-    }
-
-    // Guards m_acceptor between stop() and the accept handlers
-    mutable std::mutex m_mutex;
-    // Listening socket
-    spanio::tcp::acceptor m_acceptor;
-    // Live-session counter shared with every session
-    session_counter m_active;
+    // Connections, send queues and threads
+    spanio::tcp_server m_server;
 };
 
 }
 
 #if !defined(SPANIO_ECHO_SERVER_NO_MAIN)
 
-// Parse the command line, start the server, and run the context on the
-// requested number of threads
+// Parse the command line and run the server
 // Parameter argc: argument count
 // Parameter argv: arguments; see the file header
 // Return value: kExitUsage for a bad command line, kExitFailure if the
@@ -377,30 +260,11 @@ int main(int argc, char** argv)
     }
     try
     {
-        spanio::io_context context;
-        echo::echo_server server(context, spanio::tcp::endpoint(spanio::ipv4::any(), opts.m_port));
-        server.start();
-        std::error_code ec;
-        const spanio::tcp::endpoint local = server.local_endpoint(ec);
-        std::printf("echo_server listening on %s:%u with %u thread(s), backend %s\n",
-                    local.address().to_string().c_str(), static_cast<unsigned>(local.port()),
-                    opts.m_threads, context.backend_name());
+        echo::echo_server server(opts.m_port);
+        std::printf("echo_server listening on port %u with %u thread(s), backend %s\n",
+                    static_cast<unsigned>(opts.m_port), opts.m_threads, server.backend_name());
         std::fflush(stdout);
-
-        auto run_context = [&context]()
-        {
-            context.run();
-        };
-        std::vector<std::thread> workers;
-        for (unsigned i = 1; i < opts.m_threads; ++i)
-        {
-            workers.emplace_back(run_context);
-        }
-        run_context();
-        for (std::thread& worker : workers)
-        {
-            worker.join();
-        }
+        server.run(opts.m_threads);
     }
     catch (const std::exception& e)
     {

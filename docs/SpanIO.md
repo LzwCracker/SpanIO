@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.8（设计草案，按 M1 实现修订）
+> 版本：v0.9（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.9 修订记录（2026-11-06）**：`examples/echo_server.cpp` 改为基于 `tcp_server` 实现。
+> - 7.2：说明该示例用低层接口，一般服务建议用 `tcp_server`。
+> - 行为变化：`stop()` 现在也会断开已连接的客户端；客户端只发不读时，积压的回显超过 16 MiB 后连接被断开（原实现读完一段写完才读下一段，靠 TCP 流控限速）。
 >
 > **v0.8 修订记录（2026-11-06）**：实现 M2 示例 `examples/chat_server.cpp`。
 > - 6.5：增加基于 `tcp_server` 的 `chat_server` 示例说明。
@@ -537,7 +541,7 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 
 参考 `cpp-httplib` 的易用性思路：**不强制继承任何基类，不强制实现大量虚函数**。
 
-一个最小 TCP 回显服务示例（按 v0.5 实现的接口，`examples/echo_server.cpp` 将以此为基础）：
+用低层接口 `tcp::socket / acceptor` 写一个最小 TCP 回显服务（按 v0.5 实现的接口）。需要自己管理连接时可以这样写；一般服务建议用 6.5 的 `tcp_server`，`examples/echo_server.cpp` 就是基于它实现的，业务代码只有一个回调：
 
 ```cpp
 #include <spanio/tcp.h>
@@ -709,7 +713,7 @@ spanio/
 │    
 ├── examples/
 │   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
-│   ├── echo_server.cpp         # M1 验收示例：多线程 TCP 回显服务（已实现）
+│   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务（已实现）
 │   ├── timer_demo.cpp
 │   └── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 ├── tests/
