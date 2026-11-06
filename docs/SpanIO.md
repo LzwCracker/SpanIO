@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.11（设计草案，按 M1 实现修订）
+> 版本：v0.12（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.12 修订记录（2026-11-07）**：实现定时器 `steady_timer`，开始 M3。
+> - 新增 6.8：`steady_timer` 的接口、约定和实现。
+> - 5.3：“工作”增加挂起的定时器等待。
+> - 11.1：示例改为可编译的写法；十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.11 修订记录（2026-11-06）**：增加高层服务端封装 `udp_server`，M2 在 Windows 上完成。
 > - 新增 6.7：`udp_server`、`udp_server_options`、`udp_server_stats` 的接口、约定和限制；示例 `examples/udp_echo_server.cpp`。
@@ -367,7 +372,7 @@ v0.4 确定的语义：
 | 约定        | 内容                                                                                                             |
 | --------- | -------------------------------------------------------------------------------------------------------------- |
 | 线程来源      | 由用户线程调用 `run()`，`io_context` 自身**不创建线程**（取消 v0.3 草图中的 `concurrency_hint` 和 `threads_`）                            |
-| 工作计数      | “工作” = 队列中的 handler + 已发起未完成的 IO 操作 + 存活的 `executor_work_guard`。降为 0 或调用 `stop()` 时 `run()` 返回，此后 `stopped()` 为真，需 `restart()` 才能再次运行 |
+| 工作计数      | “工作” = 队列中的 handler + 挂起的定时器等待 + 已发起未完成的 IO 操作 + 存活的 `executor_work_guard`。降为 0 或调用 `stop()` 时 `run()` 返回，此后 `stopped()` 为真，需 `restart()` 才能再次运行 |
 | 多线程 run() | proactor 同一时刻只允许一个线程 `poll()`：同一时刻只有一个线程充当轮询者，把完成的 IO 操作转换成 handler 入队；其余线程在条件变量上等待并从队列取 handler。任意线程 `post` 时唤醒一个等待线程，没有等待线程时 `interrupt()` 轮询者 |
 | 异常        | handler 抛出的异常从 `run()` 传出，context 状态保持一致，再次调用 `run()` 继续执行剩余 handler                                          |
 | 析构        | 未执行的 handler 只销毁不调用；先从 proactor 取回所有已发起的 IO 操作（调用方应已取消或注销其 socket）再销毁。最多等待 5 秒，超时则记录日志并泄漏，而不是释放内核仍可能写入的内存 |
@@ -619,6 +624,50 @@ server.run();                    // 阻塞到 stop()
 
 示例 `examples/udp_echo_server.cpp`（`udp_echo_server [port]`，默认端口 9000）基于 `udp_server` 实现。
 
+### 6.8 定时器 steady_timer（v0.12）
+
+实现见 `include/spanio/timer.h`。定时器基于单调时钟，等待通过 `io_context` 完成。
+
+```cpp
+class steady_timer                                    // 不可复制，也不可移动
+{
+public:
+    using clock = std::chrono::steady_clock;
+    using duration = clock::duration;
+    using time_point = clock::time_point;
+
+    explicit steady_timer(io_context& ctx);           // 默认已到期
+    steady_timer(io_context& ctx, duration delay);
+    steady_timer(io_context& ctx, time_point when);
+
+    std::size_t expires_after(duration delay);        // 取消挂起的等待，返回取消数量
+    std::size_t expires_at(time_point when);
+    time_point expiry() const;
+
+    template <typename H> void async_wait(H&& h);     // h(std::error_code)
+    std::size_t cancel();                             // 返回取消数量
+};
+```
+
+| 约定      | 内容                                                                                  |
+| ------- | ----------------------------------------------------------------------------------- |
+| 结果      | 到期时 `ec` 为空，取消时为 `errc::operation_canceled`，每个等待恰好回调一次                                |
+| 回调时机    | 从不内联，已过期的定时器也通过 `run()` 回调                                                          |
+| 精度      | **绝不提前**；等待时长向上取整到毫秒，系统繁忙时可能晚触发                                                     |
+| 工作计数    | 挂起的等待算工作，`run()` 等到它结束                                                              |
+| 多个等待    | 一个定时器可以有多个等待，到期或取消时全部回调                                                             |
+| 取消来不及   | 回调已入队后 `cancel()` 返回 0，回调收到成功，依赖取消结果的代码要看 `ec` 或返回值                                   |
+| 销毁      | 销毁定时器以取消方式回调；销毁 `io_context` 时未执行的等待只销毁不调用。`io_context` 必须比定时器活得更久                    |
+| `stop()` | 挂起的定时器保留，`restart()` 后继续                                                            |
+| 线程安全    | 不同定时器可在不同线程使用，同一个定时器对象不能被多个线程同时操作                                                   |
+
+实现（`detail/timer_queue.h`）：
+
+- `io_context` 持有按到期时间排序的 `timer_queue`，每个定时器只占一项，所以取消是 O(log n)，同一到期时间按发起顺序。
+- 轮询者调用 `io_proactor::poll()` 时用最早到期时间算出超时，**proactor 不用改**，所有后端自动支持。新加入的定时器如果成为最早到期的，就唤醒轮询者重新计算。
+- 每取一个 handler 前都检查到期，持续有 handler 排队时定时器也不会被饿死，代价是多读一次时钟。
+- 到期的等待转成普通 handler 进入任务队列，之后的调度与其他 handler 相同。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -784,13 +833,14 @@ spanio/
 │       ├── framing.h               # 消息分帧：按行、长度前缀（已实现）
 │       ├── udp.h                   # UDP 接口：udp::socket（已实现）
 │       ├── udp_server.h            # 高层 UDP 服务端：udp_server（已实现）
-│       ├── timer.h                 # 定时器
+│       ├── timer.h                 # 定时器 steady_timer（已实现）
 │       ├── resolver.h              # 域名解析
 │       └── detail/
 │           ├── platform.h          # 平台宏与类型别名（已实现）
 │           ├── socket_ops.h        # socket 生命周期封装（已实现）
 │           ├── socket_common.h     # tcp.h 与 udp.h 共用的辅助代码（已实现）
 │           ├── run_threads.h       # 在多个线程上运行 io_context（已实现）
+│           ├── timer_queue.h       # 按到期时间排序的定时器队列（已实现）
 │           ├── io_reactor.h        # 就绪通知抽象接口与事件定义（已实现）
 │           ├── platform_reactor.h  # 按平台选择默认后端（已实现）
 │           ├── epoll_reactor.h     # Linux epoll 后端，水平触发（已实现）
@@ -806,7 +856,7 @@ spanio/
 ├── examples/
 │   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
 │   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务（已实现）
-│   ├── timer_demo.cpp
+│   ├── timer_demo.cpp          # 定时器示例（已实现）
 │   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 │   └── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
 ├── tests/
@@ -817,6 +867,7 @@ spanio/
 │   ├── test_chat_server.cpp    # 聊天示例测试（已实现）
 │   ├── test_udp.cpp            # udp::socket 测试（已实现）
 │   ├── test_udp_server.cpp     # udp_server 与 UDP 回显示例测试（已实现）
+│   ├── test_timer.cpp          # steady_timer 测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -838,21 +889,31 @@ spanio/
 ### 11.1 定时器示例
 
 ```cpp
-#include <spanio/spanio.hpp>
+#include <spanio/timer.h>
+
+#include <chrono>
 #include <cstdio>
 
-int main() {
+int main()
+{
     spanio::io_context ctx;
-    spanio::steady_timer t(ctx, std::chrono::seconds(1));
+    spanio::steady_timer timer(ctx, std::chrono::seconds(1));
 
-    t.async_wait([&](std::error_code ec) {
-        if (!ec) std::puts("1 second elapsed");
-    });
+    auto on_timeout = [](std::error_code ec)
+    {
+        if (!ec)
+        {
+            std::puts("1 second elapsed");
+        }
+    };
+    timer.async_wait(on_timeout);
 
     ctx.run();
     return 0;
 }
 ```
+
+完整示例见 `examples/timer_demo.cpp`：定时器在回调里重新设置自己，连续触发 3 次。
 
 ### 11.2 跨平台编译验证
 
@@ -881,7 +942,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**Windows 已完成**；**Linux 待验证**） |
-| M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer 已完成） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 

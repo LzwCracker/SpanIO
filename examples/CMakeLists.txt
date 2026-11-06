@@ -14,6 +14,7 @@ set(SPANIO_EXAMPLE_NAMES
     echo_server
     chat_server
     udp_echo_server
+    timer_demo
 )
 
 foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)

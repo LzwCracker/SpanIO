@@ -20,6 +20,7 @@ set(SPANIO_TEST_NAMES
     test_chat_server
     test_udp
     test_udp_server
+    test_timer
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)

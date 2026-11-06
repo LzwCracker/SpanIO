@@ -9,7 +9,8 @@
 //               ctx.run();          // returns once there is no more work
 //
 //               Semantics (modeled on Asio):
-//               - "Work" is: queued handlers, started I/O operations that
+//               - "Work" is: queued handlers, pending timer waits, started
+//                 I/O operations that
 //                 have not finished, and live executor_work_guard objects.
 //                 run() returns when work drops to zero or stop() is called;
 //                 the context is then stopped() and needs restart() before
@@ -40,6 +41,7 @@
 #include "spanio/detail/platform.h"
 #include "spanio/detail/platform_proactor.h"
 #include "spanio/detail/scheduler_op.h"
+#include "spanio/detail/timer_queue.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -307,6 +309,58 @@ public:
         m_proactor->start(op);
     }
 
+    // Add a wait to a timer; used by steady_timer. The context owns the wait
+    // from now on, and it counts as work until its handler has run.
+    // Parameter state:    the timer's state; must stay valid until the wait
+    //                     leaves the timer (the timer cancels in its
+    //                     destructor)
+    // Parameter deadline: when the timer expires
+    // Parameter op:       wait created with detail::make_wait_op()
+    void schedule_timer(detail::timer_state& state, detail::timer_time_point deadline,
+                        detail::timer_wait_op* op)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_outstanding_work;
+        if (m_timers.add(state, deadline, op))
+        {
+            // The thread polling is waiting for a later deadline, or for no
+            // deadline at all
+            if (m_poller_active)
+            {
+                interrupt_poller_locked();
+            }
+            else
+            {
+                wake_one_idle_locked();
+            }
+        }
+    }
+
+    // Cancel the waits of a timer; used by steady_timer. Their handlers run
+    // with errc::operation_canceled.
+    // Parameter state: the timer's state
+    // Return value: number of waits cancelled
+    std::size_t cancel_timer(detail::timer_state& state)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        detail::op_queue cancelled;
+        const std::size_t count = m_timers.cancel(state, cancelled);
+        if (count != 0)
+        {
+            // The waits stay counted as work, now as queued handlers
+            m_queue.splice(cancelled);
+            if (m_idle_threads > 0)
+            {
+                m_cond.notify_one();
+            }
+            else
+            {
+                interrupt_poller_locked();
+            }
+        }
+        return count;
+    }
+
     // Name of the proactor backend, for logs and tests
     // Return value: static string, never null
     const char* backend_name() const noexcept
@@ -418,6 +472,32 @@ private:
         }
     }
 
+    // Queue the handlers of every timer that has expired. Caller holds
+    // m_mutex.
+    void take_due_timers_locked()
+    {
+        if (!m_timers.empty())
+        {
+            m_timers.take_due(detail::timer_clock::now(), m_queue);
+        }
+    }
+
+    // How long the next proactor poll may wait. Caller holds m_mutex.
+    // Parameter block: false means not at all
+    // Return value: timeout for io_proactor::poll()
+    int poll_timeout_locked(bool block) const
+    {
+        if (!block)
+        {
+            return detail::kContextNoWait;
+        }
+        if (m_timers.empty())
+        {
+            return detail::kInfiniteTimeout;
+        }
+        return m_timers.wait_ms(detail::timer_clock::now());
+    }
+
     // Run at most one handler
     // Parameter block: true waits for a handler, false returns at once
     // Return value: 1 if a handler ran, otherwise 0
@@ -426,13 +506,16 @@ private:
         std::unique_lock<std::mutex> lock(m_mutex);
         while (!m_stopped)
         {
+            // Checked before every handler, so a steady stream of handlers
+            // cannot keep a timer from firing
+            take_due_timers_locked();
             if (!m_queue.empty())
             {
                 detail::scheduler_op* op = m_queue.pop();
                 // Hand the remaining handlers to another thread, and make
-                // sure someone keeps collecting I/O while this thread is
+                // sure someone keeps collecting I/O and timers while this thread is
                 // busy in the handler
-                if (!m_queue.empty() || (!m_poller_active && m_outstanding_io > 0))
+                if (!m_queue.empty() || (!m_poller_active && (m_outstanding_io > 0 || !m_timers.empty())))
                 {
                     wake_one_idle_locked();
                 }
@@ -469,15 +552,17 @@ private:
     // Become the poller: wait in the proactor without holding the lock, then
     // queue the completion handlers of the returned operations.
     // Parameter lock:  holds m_mutex on entry and on return
-    // Parameter block: true waits without limit, false does not wait
+    // Parameter block: true waits until the next timer is due (without limit
+    //                  if there is none), false does not wait
     void poll_proactor(std::unique_lock<std::mutex>& lock, bool block)
     {
         m_poller_active = true;
         m_poller_interrupted = false;
+        const int timeout_ms = poll_timeout_locked(block);
         lock.unlock();
 
         std::error_code ec;
-        m_proactor->poll(m_completions, block ? detail::kInfiniteTimeout : detail::kContextNoWait, ec);
+        m_proactor->poll(m_completions, timeout_ms, ec);
 
         lock.lock();
         m_poller_active = false;
@@ -509,6 +594,7 @@ private:
             std::lock_guard<std::mutex> lock(m_mutex);
             m_stopped = true;
             pending.splice(m_queue);
+            m_timers.take_all(pending);
         }
         destroy_all(pending);
 
@@ -566,6 +652,8 @@ private:
     std::condition_variable m_cond;
     // Handlers ready to run, in order
     detail::op_queue m_queue;
+    // Timers with pending waits; each wait counts as work
+    detail::timer_queue m_timers;
     // Queued handlers + started I/O operations + live work guards
     std::size_t m_outstanding_work;
     // Started I/O operations the proactor has not returned yet
