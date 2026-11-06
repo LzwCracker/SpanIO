@@ -2,6 +2,8 @@
 // File purpose: IP addresses for the networking API:
 //               - ip::address:      an IPv4 or IPv6 address (value type)
 //               - ip::make_address: parse dotted / colon text into an address
+//               - ip::endpoint:     an address and a port (tcp::endpoint and
+//                                   udp::endpoint are aliases of it)
 //               - ipv4::any() / ipv4::loopback(), ipv6::any() /
 //                 ipv6::loopback(): the well-known addresses
 // Usage:        std::error_code ec;
@@ -25,6 +27,7 @@
 #include "spanio/detail/socket_ops.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -216,6 +219,136 @@ inline address make_address(const std::string& text)
     }
     return result;
 }
+
+// An IP address and a port. Default-constructed it is 0.0.0.0:0.
+class endpoint
+{
+public:
+    // The IPv4 wildcard address with port 0
+    endpoint() noexcept
+        : endpoint(ip::address(), 0)
+    {
+    }
+
+    // Parameter address: IPv4 or IPv6 address
+    // Parameter port:    port in host byte order; 0 lets bind() pick one
+    endpoint(const ip::address& address, std::uint16_t port) noexcept
+        : m_data{}
+        , m_size(0)
+    {
+        if (address.is_v4())
+        {
+            sockaddr_in v4{};
+            v4.sin_family = AF_INET;
+            v4.sin_port = htons(port);
+            v4.sin_addr = address.to_v4();
+            std::memcpy(&m_data, &v4, sizeof(v4));
+            m_size = static_cast<detail::socklen_type>(sizeof(v4));
+        }
+        else
+        {
+            sockaddr_in6 v6{};
+            v6.sin6_family = AF_INET6;
+            v6.sin6_port = htons(port);
+            v6.sin6_addr = address.to_v6();
+            v6.sin6_scope_id = address.scope_id();
+            std::memcpy(&m_data, &v6, sizeof(v6));
+            m_size = static_cast<detail::socklen_type>(sizeof(v6));
+        }
+    }
+
+    // Build an endpoint from a socket address returned by the system
+    // Parameter data: sockaddr_in or sockaddr_in6
+    // Parameter size: bytes valid at data
+    // Return value: the endpoint
+    static endpoint from_native(const sockaddr* data, detail::socklen_type size) noexcept
+    {
+        endpoint result;
+        std::size_t length = static_cast<std::size_t>(size);
+        if (length > sizeof(result.m_data))
+        {
+            length = sizeof(result.m_data);
+        }
+        std::memset(&result.m_data, 0, sizeof(result.m_data));
+        std::memcpy(&result.m_data, data, length);
+        result.m_size = static_cast<detail::socklen_type>(length);
+        return result;
+    }
+
+    // Address family
+    // Return value: AF_INET or AF_INET6
+    int family() const noexcept
+    {
+        return m_data.ss_family;
+    }
+
+    // The IP address
+    // Return value: the address part
+    ip::address address() const noexcept
+    {
+        if (family() == AF_INET6)
+        {
+            sockaddr_in6 v6{};
+            std::memcpy(&v6, &m_data, sizeof(v6));
+            return ip::address::from_v6(v6.sin6_addr, v6.sin6_scope_id);
+        }
+        sockaddr_in v4{};
+        std::memcpy(&v4, &m_data, sizeof(v4));
+        return ip::address::from_v4(v4.sin_addr);
+    }
+
+    // The port
+    // Return value: port in host byte order
+    std::uint16_t port() const noexcept
+    {
+        if (family() == AF_INET6)
+        {
+            sockaddr_in6 v6{};
+            std::memcpy(&v6, &m_data, sizeof(v6));
+            return ntohs(v6.sin6_port);
+        }
+        sockaddr_in v4{};
+        std::memcpy(&v4, &m_data, sizeof(v4));
+        return ntohs(v4.sin_port);
+    }
+
+    // The socket address for system calls
+    // Return value: pointer to the stored address
+    const sockaddr* data() const noexcept
+    {
+        return reinterpret_cast<const sockaddr*>(&m_data);
+    }
+
+    // Number of meaningful bytes at data()
+    // Return value: sizeof(sockaddr_in) or sizeof(sockaddr_in6)
+    detail::socklen_type size() const noexcept
+    {
+        return m_size;
+    }
+
+    // Two endpoints are equal when address and port match
+    // Parameter other: endpoint to compare with
+    // Return value: true when equal
+    bool operator==(const endpoint& other) const noexcept
+    {
+        return address() == other.address() && port() == other.port();
+    }
+
+    // Negation of operator==
+    // Parameter other: endpoint to compare with
+    // Return value: true when different
+    bool operator!=(const endpoint& other) const noexcept
+    {
+        return !(*this == other);
+    }
+
+private:
+    // The socket address (sockaddr_in or sockaddr_in6)
+    sockaddr_storage m_data;
+    // Number of meaningful bytes in m_data
+    detail::socklen_type m_size;
+};
+
 
 }}
 

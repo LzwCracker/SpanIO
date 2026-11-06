@@ -38,7 +38,10 @@ enum misc_errors
     // tcp_server: the framer reported malformed input
     framing_error,
     // tcp_server: a user callback threw an exception
-    handler_failed
+    handler_failed,
+    // udp::socket: a datagram was larger than the receive buffer; the part
+    // that fit was delivered and the rest is lost
+    datagram_truncated
 };
 
 // Category of misc_errors
@@ -67,6 +70,8 @@ public:
             return "Send queue full";
         case framing_error:
             return "Malformed message framing";
+        case datagram_truncated:
+            return "Datagram truncated";
         case handler_failed:
             return "User callback failed";
         default:

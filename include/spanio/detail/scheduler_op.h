@@ -200,6 +200,10 @@ struct io_result
     std::error_code m_ec;
     // Bytes transferred by recv / send; 0 for other kinds
     std::size_t m_bytes;
+    // Datagram receive: the sender's address
+    sockaddr_storage m_address;
+    // Datagram receive: number of meaningful bytes in m_address
+    socklen_type m_address_len;
     // Accepted socket for an accept, now owned by the handler; otherwise
     // kInvalidHandle
     native_handle_t m_accepted;
@@ -240,7 +244,8 @@ private:
     static void do_complete(scheduler_op* base, bool invoke)
     {
         std::unique_ptr<io_op> self(static_cast<io_op*>(base));
-        const io_result result{self->m_ec, self->m_bytes, self->m_accepted};
+        const io_result result{self->m_ec, self->m_bytes, self->m_address, self->m_address_len,
+                               self->m_accepted};
         if (!invoke)
         {
             if (result.m_accepted != kInvalidHandle)

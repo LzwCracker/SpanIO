@@ -43,6 +43,7 @@
 #include "spanio/ip.h"
 #include "spanio/detail/io_proactor.h"
 #include "spanio/detail/platform.h"
+#include "spanio/detail/socket_common.h"
 #include "spanio/detail/scheduler_op.h"
 #include "spanio/detail/socket_ops.h"
 
@@ -62,134 +63,8 @@ constexpr int kDefaultBacklog = SOMAXCONN;
 // Value that turns a boolean socket option on
 constexpr int kSocketOptionOn = 1;
 
-// An IP address and a port. Default-constructed it is 0.0.0.0:0.
-class endpoint
-{
-public:
-    // The IPv4 wildcard address with port 0
-    endpoint() noexcept
-        : endpoint(ip::address(), 0)
-    {
-    }
-
-    // Parameter address: IPv4 or IPv6 address
-    // Parameter port:    port in host byte order; 0 lets bind() pick one
-    endpoint(const ip::address& address, std::uint16_t port) noexcept
-        : m_data{}
-        , m_size(0)
-    {
-        if (address.is_v4())
-        {
-            sockaddr_in v4{};
-            v4.sin_family = AF_INET;
-            v4.sin_port = htons(port);
-            v4.sin_addr = address.to_v4();
-            std::memcpy(&m_data, &v4, sizeof(v4));
-            m_size = static_cast<detail::socklen_type>(sizeof(v4));
-        }
-        else
-        {
-            sockaddr_in6 v6{};
-            v6.sin6_family = AF_INET6;
-            v6.sin6_port = htons(port);
-            v6.sin6_addr = address.to_v6();
-            v6.sin6_scope_id = address.scope_id();
-            std::memcpy(&m_data, &v6, sizeof(v6));
-            m_size = static_cast<detail::socklen_type>(sizeof(v6));
-        }
-    }
-
-    // Build an endpoint from a socket address returned by the system
-    // Parameter data: sockaddr_in or sockaddr_in6
-    // Parameter size: bytes valid at data
-    // Return value: the endpoint
-    static endpoint from_native(const sockaddr* data, detail::socklen_type size) noexcept
-    {
-        endpoint result;
-        std::size_t length = static_cast<std::size_t>(size);
-        if (length > sizeof(result.m_data))
-        {
-            length = sizeof(result.m_data);
-        }
-        std::memset(&result.m_data, 0, sizeof(result.m_data));
-        std::memcpy(&result.m_data, data, length);
-        result.m_size = static_cast<detail::socklen_type>(length);
-        return result;
-    }
-
-    // Address family
-    // Return value: AF_INET or AF_INET6
-    int family() const noexcept
-    {
-        return m_data.ss_family;
-    }
-
-    // The IP address
-    // Return value: the address part
-    ip::address address() const noexcept
-    {
-        if (family() == AF_INET6)
-        {
-            sockaddr_in6 v6{};
-            std::memcpy(&v6, &m_data, sizeof(v6));
-            return ip::address::from_v6(v6.sin6_addr, v6.sin6_scope_id);
-        }
-        sockaddr_in v4{};
-        std::memcpy(&v4, &m_data, sizeof(v4));
-        return ip::address::from_v4(v4.sin_addr);
-    }
-
-    // The port
-    // Return value: port in host byte order
-    std::uint16_t port() const noexcept
-    {
-        if (family() == AF_INET6)
-        {
-            sockaddr_in6 v6{};
-            std::memcpy(&v6, &m_data, sizeof(v6));
-            return ntohs(v6.sin6_port);
-        }
-        sockaddr_in v4{};
-        std::memcpy(&v4, &m_data, sizeof(v4));
-        return ntohs(v4.sin_port);
-    }
-
-    // The socket address for system calls
-    // Return value: pointer to the stored address
-    const sockaddr* data() const noexcept
-    {
-        return reinterpret_cast<const sockaddr*>(&m_data);
-    }
-
-    // Number of meaningful bytes at data()
-    // Return value: sizeof(sockaddr_in) or sizeof(sockaddr_in6)
-    detail::socklen_type size() const noexcept
-    {
-        return m_size;
-    }
-
-    // Two endpoints are equal when address and port match
-    // Parameter other: endpoint to compare with
-    // Return value: true when equal
-    bool operator==(const endpoint& other) const noexcept
-    {
-        return address() == other.address() && port() == other.port();
-    }
-
-    // Negation of operator==
-    // Parameter other: endpoint to compare with
-    // Return value: true when different
-    bool operator!=(const endpoint& other) const noexcept
-    {
-        return !(*this == other);
-    }
-
-private:
-    // The socket address (sockaddr_in or sockaddr_in6)
-    sockaddr_storage m_data;
-    // Number of meaningful bytes in m_data
-    detail::socklen_type m_size;
-};
+// An IP address and a port
+using endpoint = ip::endpoint;
 
 // Which direction socket::shutdown() closes
 enum shutdown_type
@@ -215,105 +90,6 @@ enum shutdown_type
 
 namespace spanio { namespace detail {
 
-// Error used when an operation is started on a socket that is not open
-// Return value: errc::bad_file_descriptor
-inline std::error_code not_open_error() noexcept
-{
-    return std::make_error_code(std::errc::bad_file_descriptor);
-}
-
-// Error used when open() / assign() is called on a socket that is open
-// Return value: errc::invalid_argument
-inline std::error_code already_open_error() noexcept
-{
-    return std::make_error_code(std::errc::invalid_argument);
-}
-
-// Read the local or remote address of a socket
-// Parameter handle: open socket
-// Parameter remote: true for the peer (getpeername), false for the local side
-// Parameter ec:     set to the failure reason, or cleared
-// Return value: the endpoint, or a default endpoint on failure
-inline tcp::endpoint query_endpoint(native_handle_t handle, bool remote, std::error_code& ec)
-{
-    ec.clear();
-    if (handle == kInvalidHandle)
-    {
-        ec = not_open_error();
-        return tcp::endpoint();
-    }
-    sockaddr_storage storage{};
-    socklen_type length = static_cast<socklen_type>(sizeof(storage));
-    sockaddr* address = reinterpret_cast<sockaddr*>(&storage);
-    const int result = remote ? ::getpeername(handle, address, &length)
-                              : ::getsockname(handle, address, &length);
-    if (result == kSocketCallFailed)
-    {
-        ec = last_error();
-        return tcp::endpoint();
-    }
-    return tcp::endpoint::from_native(address, length);
-}
-
-// Task that calls a handler with a stored error; used to report failures
-// that are known before an operation starts, without running it inline
-template <typename Handler>
-class error_binder
-{
-public:
-    // Parameter handler: function object taking (std::error_code)
-    // Parameter ec:      error to pass
-    template <typename H>
-    error_binder(H&& handler, const std::error_code& ec)
-        : m_handler(std::forward<H>(handler))
-        , m_ec(ec)
-    {
-    }
-
-    // Call the handler with the stored error
-    void operator()()
-    {
-        m_handler(m_ec);
-    }
-
-private:
-    // User handler
-    Handler m_handler;
-    // Error to pass
-    std::error_code m_ec;
-};
-
-// Task that calls a handler with a stored error and byte count
-template <typename Handler>
-class transfer_binder
-{
-public:
-    // Parameter handler: function object taking (std::error_code, std::size_t)
-    // Parameter ec:      error to pass
-    // Parameter bytes:   byte count to pass
-    template <typename H>
-    transfer_binder(H&& handler, const std::error_code& ec, std::size_t bytes)
-        : m_handler(std::forward<H>(handler))
-        , m_ec(ec)
-        , m_bytes(bytes)
-    {
-    }
-
-    // Call the handler with the stored values
-    void operator()()
-    {
-        m_handler(m_ec, m_bytes);
-    }
-
-private:
-    // User handler
-    Handler m_handler;
-    // Error to pass
-    std::error_code m_ec;
-    // Byte count to pass
-    std::size_t m_bytes;
-};
-
 // Completion of a connect: passes only the error
 template <typename Handler>
 class connect_completion
@@ -335,39 +111,6 @@ public:
 private:
     // User handler
     Handler m_handler;
-};
-
-// Completion of a single recv or send: passes the error and byte count.
-// For reads, 0 bytes without an error becomes spanio::error::eof.
-template <typename Handler>
-class transfer_completion
-{
-public:
-    // Parameter handler: function object taking (std::error_code, std::size_t)
-    // Parameter is_read: whether 0 bytes means end of file
-    template <typename H>
-    transfer_completion(H&& handler, bool is_read)
-        : m_handler(std::forward<H>(handler))
-        , m_is_read(is_read)
-    {
-    }
-
-    // Parameter result: the finished operation
-    void operator()(const io_result& result)
-    {
-        std::error_code ec = result.m_ec;
-        if (!ec && m_is_read && result.m_bytes == 0)
-        {
-            ec = error::eof;
-        }
-        m_handler(ec, result.m_bytes);
-    }
-
-private:
-    // User handler
-    Handler m_handler;
-    // true for recv, false for send
-    bool m_is_read;
 };
 
 // Composed operation behind socket::async_write: keeps sending the rest of

@@ -136,6 +136,12 @@ public:
         case op_kind::kSend:
             start_send(*op);
             break;
+        case op_kind::kRecvFrom:
+            start_recv_from(*op);
+            break;
+        case op_kind::kSendTo:
+            start_send_to(*op);
+            break;
         case op_kind::kPost:
         default:
             post(op);
@@ -446,6 +452,50 @@ private:
         buffer.len = clamp_transfer(op.m_size);
         if (::WSASend(op.m_handle, &buffer, kProactorBufferCount, nullptr, 0,
                       &op.m_overlapped, nullptr) == SOCKET_ERROR)
+        {
+            const int error = ::WSAGetLastError();
+            if (error != WSA_IO_PENDING)
+            {
+                fail_start(op, std::error_code(error, std::system_category()));
+            }
+        }
+    }
+
+    // Start WSARecvFrom. The sender address and its length are written into
+    // the operation when the request completes.
+    // Parameter op: prepared datagram receive operation
+    void start_recv_from(io_operation& op)
+    {
+        WSABUF buffer;
+        buffer.buf = op.m_buffer;
+        buffer.len = clamp_transfer(op.m_size);
+        DWORD flags = 0;
+        if (::WSARecvFrom(op.m_handle, &buffer, kProactorBufferCount, nullptr, &flags,
+                          reinterpret_cast<sockaddr*>(&op.m_address), &op.m_address_len,
+                          &op.m_overlapped, nullptr) == SOCKET_ERROR)
+        {
+            const int error = ::WSAGetLastError();
+            // A truncated datagram is not an immediate failure: measured on
+            // Windows, the call reports WSA_IO_PENDING even when the datagram
+            // was already waiting, and the one completion packet carries
+            // STATUS_BUFFER_OVERFLOW, which finish_io() turns into WSAEMSGSIZE
+            if (error != WSA_IO_PENDING)
+            {
+                fail_start(op, std::error_code(error, std::system_category()));
+            }
+        }
+    }
+
+    // Start WSASendTo
+    // Parameter op: prepared datagram send operation
+    void start_send_to(io_operation& op)
+    {
+        WSABUF buffer;
+        buffer.buf = op.m_buffer;
+        buffer.len = clamp_transfer(op.m_size);
+        if (::WSASendTo(op.m_handle, &buffer, kProactorBufferCount, nullptr, 0,
+                        reinterpret_cast<const sockaddr*>(&op.m_address), op.m_address_len,
+                        &op.m_overlapped, nullptr) == SOCKET_ERROR)
         {
             const int error = ::WSAGetLastError();
             if (error != WSA_IO_PENDING)

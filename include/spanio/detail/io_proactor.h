@@ -1,7 +1,8 @@
 // ============================================================================
 // File purpose: Platform-neutral completion interface (Proactor). A caller
-//               starts an asynchronous operation (accept, connect, recv,
-//               send, or a plain posted task) and later collects it from
+//               starts an asynchronous operation (accept, connect, stream or
+//               datagram receive and send, or a plain posted task) and later
+//               collects it from
 //               poll() with its result already filled in. Backends:
 //               - iocp_proactor:    native IOCP (AcceptEx, ConnectEx,
 //                                   WSARecv, WSASend) on Windows
@@ -74,6 +75,12 @@ enum class op_kind
     kRecv,
     // Send from m_buffer (write side)
     kSend,
+    // Receive one datagram into m_buffer, with the sender in m_address (read
+    // side). A datagram larger than m_buffer reports errc::message_size, with
+    // m_bytes holding the part that fit.
+    kRecvFrom,
+    // Send m_buffer as one datagram to m_address (write side)
+    kSendTo,
     // No I/O: completes successfully on the next poll(); used to queue tasks
     kPost
 };
@@ -91,20 +98,22 @@ struct io_operation
     op_kind m_kind;
     // Socket the operation runs on (the listener for kAccept)
     native_handle_t m_handle;
-    // kRecv: destination buffer. kSend: source data (never written).
+    // kRecv / kRecvFrom: destination buffer. kSend / kSendTo: source data
+    // (never written).
     char* m_buffer;
     // Size of m_buffer in bytes
     std::size_t m_size;
-    // kConnect: address to connect to
+    // kConnect / kSendTo: destination address. kRecvFrom: filled in with the
+    // sender.
     sockaddr_storage m_address;
-    // kConnect: number of meaningful bytes in m_address
+    // Number of meaningful bytes in m_address
     socklen_type m_address_len;
     // kAccept result: the accepted socket, owned by the caller once the
     // operation succeeded; kInvalidHandle otherwise
     native_handle_t m_accepted;
     // Result: empty on success
     std::error_code m_ec;
-    // Result: bytes transferred by kRecv / kSend; 0 for other kinds
+    // Result: bytes transferred by receives and sends; 0 for other kinds
     std::size_t m_bytes;
 #if defined(SPANIO_PLATFORM_WINDOWS)
     // iocp_proactor: address buffer AcceptEx writes into
@@ -191,6 +200,41 @@ inline void prepare_send(io_operation& op, native_handle_t socket, const char* d
     op.m_size = size;
 }
 
+// Prepare the receive of one datagram
+// Parameter op:     operation to fill
+// Parameter socket: registered datagram socket
+// Parameter buffer: destination; must stay valid until the operation returns
+// Parameter size:   capacity of buffer in bytes
+inline void prepare_receive_from(io_operation& op, native_handle_t socket, char* buffer,
+                                 std::size_t size) noexcept
+{
+    reset_operation(op, op_kind::kRecvFrom, socket);
+    op.m_buffer = buffer;
+    op.m_size = size;
+    std::memset(&op.m_address, 0, sizeof(op.m_address));
+    op.m_address_len = static_cast<socklen_type>(sizeof(op.m_address));
+}
+
+// Prepare the send of one datagram
+// Parameter op:      operation to fill
+// Parameter socket:  registered datagram socket
+// Parameter data:    bytes to send; must stay valid until the operation returns
+// Parameter size:    number of bytes; 0 sends an empty datagram
+// Parameter address: destination address (copied into the operation)
+// Parameter length:  size of *address in bytes; at most sizeof(sockaddr_storage)
+inline void prepare_send_to(io_operation& op, native_handle_t socket, const char* data, std::size_t size,
+                            const sockaddr* address, socklen_type length) noexcept
+{
+    reset_operation(op, op_kind::kSendTo, socket);
+    // Stored without const because the field is shared with receives; send
+    // paths only ever read through it
+    op.m_buffer = const_cast<char*>(data);
+    op.m_size = size;
+    std::memset(&op.m_address, 0, sizeof(op.m_address));
+    std::memcpy(&op.m_address, address, static_cast<std::size_t>(length));
+    op.m_address_len = length;
+}
+
 // Prepare a posted task (no I/O)
 // Parameter op: operation to fill
 inline void prepare_post(io_operation& op) noexcept
@@ -200,10 +244,10 @@ inline void prepare_post(io_operation& op) noexcept
 
 // Whether an operation occupies the read side of its socket
 // Parameter kind: operation kind
-// Return value: true for kAccept and kRecv
+// Return value: true for kAccept, kRecv and kRecvFrom
 inline bool is_read_side(op_kind kind) noexcept
 {
-    return kind == op_kind::kAccept || kind == op_kind::kRecv;
+    return kind == op_kind::kAccept || kind == op_kind::kRecv || kind == op_kind::kRecvFrom;
 }
 
 // Map platform-specific "operation aborted" codes to errc::operation_canceled

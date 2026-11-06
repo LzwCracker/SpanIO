@@ -28,6 +28,10 @@
 #include "spanio/detail/io_reactor.h"
 #include "spanio/detail/socket_ops.h"
 
+#if defined(SPANIO_PLATFORM_LINUX)
+#include <sys/uio.h>
+#endif
+
 #include <climits>
 #include <memory>
 #include <mutex>
@@ -42,6 +46,11 @@ constexpr int kAdapterSendFlags = MSG_NOSIGNAL;
 #else
 // send() flags: Windows never raises SIGPIPE
 constexpr int kAdapterSendFlags = 0;
+#endif
+
+#if defined(SPANIO_PLATFORM_LINUX)
+// Buffers given to recvmsg() for one datagram
+constexpr std::size_t kAdapterDatagramIovecs = 1;
 #endif
 
 // recv() flags: none
@@ -330,6 +339,50 @@ private:
         return true;
     }
 
+    // Receive one datagram, reporting truncation as errc::message_size on
+    // every platform. Windows fails the call with WSAEMSGSIZE. POSIX
+    // recvfrom() hides truncation, which is why Linux uses recvmsg(): its
+    // MSG_TRUNC flag reveals it.
+    // Parameter op:     prepared kRecvFrom operation
+    // Parameter result: receives the system call's result when the outcome
+    //                   is decided by the common path in perform()
+    // Return value: true if the datagram was truncated and op is finished
+    bool receive_datagram(io_operation& op, long long& result)
+    {
+#if defined(SPANIO_PLATFORM_WINDOWS)
+        socklen_type length = static_cast<socklen_type>(sizeof(op.m_address));
+        const int size = static_cast<int>(clamp_transfer(op.m_size));
+        result = ::recvfrom(op.m_handle, op.m_buffer, size, kAdapterRecvFlags,
+                            reinterpret_cast<sockaddr*>(&op.m_address), &length);
+        op.m_address_len = length;
+        if (result == kSocketCallFailed && ::WSAGetLastError() == WSAEMSGSIZE)
+        {
+            op.m_bytes = static_cast<std::size_t>(size);
+            op.m_ec = std::make_error_code(std::errc::message_size);
+            return true;
+        }
+        return false;
+#else
+        iovec buffer{};
+        buffer.iov_base = op.m_buffer;
+        buffer.iov_len = clamp_transfer(op.m_size);
+        msghdr message{};
+        message.msg_name = &op.m_address;
+        message.msg_namelen = static_cast<socklen_type>(sizeof(op.m_address));
+        message.msg_iov = &buffer;
+        message.msg_iovlen = kAdapterDatagramIovecs;
+        result = ::recvmsg(op.m_handle, &message, kAdapterRecvFlags);
+        op.m_address_len = message.msg_namelen;
+        if (result != kSocketCallFailed && (message.msg_flags & MSG_TRUNC) != 0)
+        {
+            op.m_bytes = static_cast<std::size_t>(result);
+            op.m_ec = std::make_error_code(std::errc::message_size);
+            return true;
+        }
+        return false;
+#endif
+    }
+
     // Attempt the I/O of an operation once, without blocking
     // Parameter op: operation to advance
     // Return value: true if the operation now has its final result, false
@@ -364,6 +417,22 @@ private:
                             kAdapterSendFlags);
 #else
             result = ::send(op.m_handle, op.m_buffer, clamp_transfer(op.m_size), kAdapterSendFlags);
+#endif
+            break;
+        case op_kind::kRecvFrom:
+            if (receive_datagram(op, result))
+            {
+                return true;
+            }
+            break;
+        case op_kind::kSendTo:
+#if defined(SPANIO_PLATFORM_WINDOWS)
+            result = ::sendto(op.m_handle, op.m_buffer, static_cast<int>(clamp_transfer(op.m_size)),
+                              kAdapterSendFlags, reinterpret_cast<const sockaddr*>(&op.m_address),
+                              op.m_address_len);
+#else
+            result = ::sendto(op.m_handle, op.m_buffer, clamp_transfer(op.m_size), kAdapterSendFlags,
+                              reinterpret_cast<const sockaddr*>(&op.m_address), op.m_address_len);
 #endif
             break;
         case op_kind::kConnect:

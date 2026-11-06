@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.9（设计草案，按 M1 实现修订）
+> 版本：v0.10（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.10 修订记录（2026-11-06）**：实现 `udp::socket`。
+> - 新增 6.6：`udp::socket` 的接口、约定和平台差异。
+> - 4.4：`io_proactor` 增加数据报操作 `kRecvFrom / kSendTo`（`prepare_receive_from / prepare_send_to`）。
+> - `endpoint` 移到 `ip.h`，新增错误码 `error::datagram_truncated`。
+> - 十 / 十二：同步工程结构和 M2 进度。
 >
 > **v0.9 修订记录（2026-11-06）**：`examples/echo_server.cpp` 改为基于 `tcp_server` 实现。
 > - 7.2：说明该示例用低层接口，一般服务建议用 `tcp_server`。
@@ -213,7 +219,8 @@ io_reactor_ptr make_platform_reactor(std::error_code& ec);
 namespace spanio { namespace detail {
 
 // 一个异步操作：由调用方持有，用 prepare_accept / prepare_connect /
-// prepare_recv / prepare_send / prepare_post 填写；结果写回 m_ec、m_bytes、m_accepted
+// prepare_recv / prepare_send / prepare_receive_from / prepare_send_to / prepare_post 填写；
+// 结果写回 m_ec、m_bytes、m_accepted，数据报接收的发送者写回 m_address
 struct io_operation;
 
 class io_proactor
@@ -222,7 +229,7 @@ public:
     virtual ~io_proactor() = default;
     virtual std::error_code register_handle(native_handle_t handle) = 0;   // 使用前注册 socket
     virtual std::error_code unregister_handle(native_handle_t handle) = 0; // 关闭前注销，挂起操作以取消返回
-    virtual void start(io_operation* op) = 0;                              // 发起 accept / connect / recv / send
+    virtual void start(io_operation* op) = 0;                              // 发起 accept / connect / 流式或数据报收发
     virtual void cancel(native_handle_t handle) = 0;                       // 取消该 socket 上的全部挂起操作
     virtual void post(io_operation* op) = 0;                               // 投递一个无 IO 的任务
     virtual std::size_t poll(completion_list& out, int timeout_ms, std::error_code& ec) = 0;
@@ -530,6 +537,53 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 - **全局顺序：** `chat_room` 持锁广播，所有用户看到的消息顺序一致。`send()` 只是入队，持锁成本很低。
 - **避免循环引用：** 成员表持有 `weak_ptr`，因为回调持有房间，而连接持有服务端状态，强引用会形成环。
 
+### 6.6 UDP 接口 udp::socket（v0.10）
+
+实现见 `include/spanio/udp.h`。`endpoint` 移到 `ip.h` 成为 `ip::endpoint`，`tcp::endpoint` 和 `udp::endpoint` 都是它的别名。
+
+```cpp
+namespace spanio { namespace udp {
+
+using endpoint = ip::endpoint;
+
+class socket                                          // 只可移动
+{
+public:
+    explicit socket(io_context& ctx);
+    socket(io_context& ctx, const endpoint& local);   // open + bind，失败抛 std::system_error
+    std::error_code open(int family);
+    std::error_code bind(const endpoint& local);
+    endpoint local_endpoint(std::error_code& ec) const;
+    void cancel();
+    void close();
+
+    template <typename H> void async_receive_from(mutable_buffer buf, H&& h);
+    // h(std::error_code, std::size_t bytes, const endpoint& sender)
+    template <typename H> void async_send_to(const_buffer buf, const endpoint& peer, H&& h);
+    // h(std::error_code, std::size_t bytes)
+};
+
+}}
+```
+
+| 约定     | 内容                                                                                       |
+| ------ | ---------------------------------------------------------------------------------------- |
+| 消息边界   | 一次操作对应一个数据报，不会合并，也不会部分发送                                                                 |
+| 空数据报   | 0 字节是合法数据报，成功收发，UDP 没有 EOF；空接收缓冲区立即成功且不消耗数据报                                             |
+| 截断     | 缓冲区太小时报 `error::datagram_truncated`，`bytes` 为实际存入的字节数，其余丢失                                  |
+| 超大数据报  | 超过协议上限时发送报 `errc::message_size`，socket 继续可用                                               |
+| 自动打开   | `async_send_to` 在未打开时按目标地址族打开；`async_receive_from` 未打开时报 `bad_file_descriptor`                |
+| 发送者地址  | 通过回调参数传递，调用方不用自己保证地址对象的生命周期                                                              |
+| 回调与取消  | 与 TCP 相同：从不内联，恰好一次，`close()/cancel()`/析构以 `errc::operation_canceled` 完成                      |
+
+平台差异由 `detail::configure_datagram_socket()` 和后端屏蔽（均已在 Windows 上实测）：
+
+- **端口独占：** Windows 设 `SO_EXCLUSIVEADDRUSE`。实测用 `SO_REUSEADDR` 时第二个 socket 能绑定同一端口。Linux 不设 `SO_REUSEADDR`，端口默认独占（待 Linux 验证）。
+- **`WSAECONNRESET`：** Windows 默认会在向已关闭端口发送后让下一次接收失败，实测属实，因此用 `SIO_UDP_CONNRESET` 关闭。
+- **截断：** 原生 IOCP 上 `WSARecvFrom` 返回 `WSA_IO_PENDING`（即使数据报已到达），唯一的完成包状态为 `STATUS_BUFFER_OVERFLOW`，再转成 `WSAEMSGSIZE`，不会重复完成。适配器在 Windows 上 `recvfrom` 直接报 `WSAEMSGSIZE`；Linux 的 `recvfrom` 不报告截断，所以用 `recvmsg` 检查 `MSG_TRUNC`（待 Linux 验证）。
+
+本期不做 `connect` 模式的 UDP、组播和广播选项，需要时通过 `native_handle()` 设置。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -693,12 +747,13 @@ spanio/
 │       ├── tcp.h                   # TCP 接口：endpoint、socket、acceptor（已实现）
 │       ├── tcp_server.h            # 高层 TCP 服务端：tcp_server、tcp_connection（已实现）
 │       ├── framing.h               # 消息分帧：按行、长度前缀（已实现）
-│       ├── udp.h                   # UDP 接口
+│       ├── udp.h                   # UDP 接口：udp::socket（已实现）
 │       ├── timer.h                 # 定时器
 │       ├── resolver.h              # 域名解析
 │       └── detail/
 │           ├── platform.h          # 平台宏与类型别名（已实现）
 │           ├── socket_ops.h        # socket 生命周期封装（已实现）
+│           ├── socket_common.h     # tcp.h 与 udp.h 共用的辅助代码（已实现）
 │           ├── io_reactor.h        # 就绪通知抽象接口与事件定义（已实现）
 │           ├── platform_reactor.h  # 按平台选择默认后端（已实现）
 │           ├── epoll_reactor.h     # Linux epoll 后端，水平触发（已实现）
@@ -722,6 +777,7 @@ spanio/
 │   ├── test_echo_server.cpp    # 回显示例测试（已实现）
 │   ├── test_tcp_server.cpp     # tcp_server 与分帧测试（已实现）
 │   ├── test_chat_server.cpp    # 聊天示例测试（已实现）
+│   ├── test_udp.cpp            # udp::socket 测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -785,7 +841,7 @@ v0.6 验证情况：
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
-| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server 与 chat_server 已完成，udp::socket 与 udp_server 待做 |
+| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；tcp_server、chat_server、udp::socket 已完成，udp_server 待做 |
 | M3 易用性  | strand、timer、resolver、错误码统一                     | API 冻结，编写文档        |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |

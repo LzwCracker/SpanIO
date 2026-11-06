@@ -233,6 +233,54 @@ inline std::error_code set_nonblocking(native_handle_t handle, bool enable) noex
     return std::error_code();
 }
 
+#if defined(SPANIO_PLATFORM_WINDOWS)
+#if !defined(SIO_UDP_CONNRESET)
+// WSAIoctl code that controls whether ICMP "port unreachable" fails the next
+// receive; declared by newer SDKs in mswsock.h, with this same value
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#endif
+
+// Value that turns a boolean option on in configure_datagram_socket
+constexpr int kDatagramOptionOn = 1;
+
+// Give a new datagram socket the same behaviour on every platform.
+// On Windows:
+// - SO_EXCLUSIVEADDRUSE, so no other socket can bind the same port and take
+//   its datagrams
+// - SIO_UDP_CONNRESET off, so a datagram sent to a closed port does not make
+//   a later receive fail with WSAECONNRESET
+// Linux needs nothing: without SO_REUSEADDR a port is already exclusive, and
+// unconnected UDP sockets do not report ICMP errors.
+// Parameter handle: datagram socket, not bound yet
+// Return value: empty on success, otherwise the system error
+inline std::error_code configure_datagram_socket(native_handle_t handle) noexcept
+{
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    const int exclusive = kDatagramOptionOn;
+    if (::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+                     static_cast<socklen_type>(sizeof(exclusive))) == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+        log_error("configure_datagram_socket(SO_EXCLUSIVEADDRUSE)", ec);
+        return ec;
+    }
+    BOOL report_connection_reset = FALSE;
+    DWORD returned = 0;
+    if (::WSAIoctl(handle, SIO_UDP_CONNRESET, &report_connection_reset,
+                   static_cast<DWORD>(sizeof(report_connection_reset)), nullptr, 0, &returned, nullptr,
+                   nullptr) == kSocketCallFailed)
+    {
+        const std::error_code ec = last_error();
+        log_error("configure_datagram_socket(SIO_UDP_CONNRESET)", ec);
+        return ec;
+    }
+#else
+    static_cast<void>(handle);
+#endif
+    return std::error_code();
+}
+
 }}
 
 #endif // SPANIO_DETAIL_SOCKET_OPS_H
