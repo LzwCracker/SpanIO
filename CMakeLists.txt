@@ -95,7 +95,6 @@ if(SPANIO_IS_TOP_LEVEL)
         "${CMAKE_CURRENT_SOURCE_DIR}/docs/*.md")
     set(SPANIO_PROJECT_FILES
         ${SPANIO_DOC_FILES}
-        "${CMAKE_CURRENT_SOURCE_DIR}/CLAUDE.md"
         "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt"
         "${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt")

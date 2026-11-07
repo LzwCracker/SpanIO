@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.12（设计草案，按 M1 实现修订）
+> 版本：v0.13（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.13 修订记录（2026-11-07）**：完成 Linux 验证，M1 与 M2 在两个平台上完成。
+> - 新增 11.3：Linux 上的编译、测试、Sanitizer 与单文件编译结果。
+> - 修复：CMake 的 IDE 目标引用了不在仓库中的 `CLAUDE.md`，导致全新克隆时配置失败。
+> - 6.6 / 11.2 / 十二：去掉“待 Linux 验证”的标注。
 >
 > **v0.12 修订记录（2026-11-07）**：实现定时器 `steady_timer`，开始 M3。
 > - 新增 6.8：`steady_timer` 的接口、约定和实现。
@@ -587,9 +592,9 @@ public:
 
 平台差异由 `detail::configure_datagram_socket()` 和后端屏蔽（均已在 Windows 上实测）：
 
-- **端口独占：** Windows 设 `SO_EXCLUSIVEADDRUSE`。实测用 `SO_REUSEADDR` 时第二个 socket 能绑定同一端口。Linux 不设 `SO_REUSEADDR`，端口默认独占（待 Linux 验证）。
+- **端口独占：** Windows 设 `SO_EXCLUSIVEADDRUSE`。实测用 `SO_REUSEADDR` 时第二个 socket 能绑定同一端口。Linux 不设 `SO_REUSEADDR`，端口默认独占（v0.13 已在 Linux 上验证）。
 - **`WSAECONNRESET`：** Windows 默认会在向已关闭端口发送后让下一次接收失败，实测属实，因此用 `SIO_UDP_CONNRESET` 关闭。
-- **截断：** 原生 IOCP 上 `WSARecvFrom` 返回 `WSA_IO_PENDING`（即使数据报已到达），唯一的完成包状态为 `STATUS_BUFFER_OVERFLOW`，再转成 `WSAEMSGSIZE`，不会重复完成。适配器在 Windows 上 `recvfrom` 直接报 `WSAEMSGSIZE`；Linux 的 `recvfrom` 不报告截断，所以用 `recvmsg` 检查 `MSG_TRUNC`（待 Linux 验证）。
+- **截断：** 原生 IOCP 上 `WSARecvFrom` 返回 `WSA_IO_PENDING`（即使数据报已到达），唯一的完成包状态为 `STATUS_BUFFER_OVERFLOW`，再转成 `WSAEMSGSIZE`，不会重复完成。适配器在 Windows 上 `recvfrom` 直接报 `WSAEMSGSIZE`；Linux 的 `recvfrom` 不报告截断，所以用 `recvmsg` 检查 `MSG_TRUNC`（v0.13 已在 Linux 上验证）。
 
 本期不做 `connect` 模式的 UDP、组播和广播选项，需要时通过 `native_handle()` 设置。
 
@@ -930,9 +935,28 @@ cl /std:c++17 /EHsc /Iinclude examples\echo_server.cpp ws2_32.lib
 v0.6 验证情况：
 
 - Windows：上面的 `cl` 命令（另加 `/W4 /WX`）实测编译通过、无警告。`/EHsc` 是必需的：不加时 MSVC 报 C4530，抛出异常时不会正确析构对象。
-- Linux：尚未验证（开发机没有 Linux 工具链）。
+- Linux：v0.13 已验证。上面的 `g++` 命令直接可用；4 个示例另加 `-Wall -Wextra -Wpedantic -Werror` 也全部编译通过、无警告（见 11.3）。
 - CMake 构建时示例作为 `echo_server` 目标编译（`SPANIO_BUILD_EXAMPLES`，顶层项目默认开启），与测试使用相同的严格警告级别。
 - 测试 `tests/test_echo_server.cpp` 以 `SPANIO_ECHO_SERVER_NO_MAIN` 包含示例源码，测试的正是发布的这份代码。
+
+### 11.3 Linux 验证（v0.13）
+
+在 `026e250` 上，于 Ubuntu 24.04（内核 6.8，`g++` 13.3，`cmake` 3.28）从 GitHub 全新克隆后验证：
+
+| 项目                                | 结果                                                                     |
+| --------------------------------- | ---------------------------------------------------------------------- |
+| 编译                                | Debug 与 Release，`-Wall -Wextra -Wpedantic -Werror`，0 错误 0 警告               |
+| 测试                                | 11 个程序、150 个用例全部通过（含 1 个仅 Linux 的用例），后端为 `reactor-proactor over epoll` |
+| 重复运行                              | Debug 与 Release 各连续 20 次，无失败                                             |
+| AddressSanitizer + UBSan + LeakSanitizer | 全部通过，无内存错误、未定义行为或泄漏                                                   |
+| ThreadSanitizer                   | 全部通过，无数据竞争                                                             |
+| 单文件编译                             | 4 个示例加 `-Werror` 全部通过，文档中的一行命令可直接使用                                      |
+
+几点说明：
+
+- **发现的问题：** 全新克隆时 CMake 配置失败，原因是 IDE 目标 `spanio_docs` 引用了已不在仓库中的 `CLAUDE.md`。v0.13 已修复。
+- **之前只能推测的行为：** Linux 上非阻塞 `send` 确实会部分发送。让 `async_write` 只发一次时，用例 8 会因数据不全而卡住，这与 Windows 上“从不部分发送”的实测相反，所以续发路径在 Linux 上是真实会走到的。UDP 截断（`recvmsg` 加 `MSG_TRUNC`）、UDP 端口默认独占、非阻塞 `connect` 也都由对应用例在 Linux 上验证通过。
+- **ThreadSanitizer 的环境问题：** 在 `vm.mmap_rnd_bits = 32` 的内核上，GCC 13 的 TSan 启动时会报 `unexpected memory mapping`，这是工具链的已知问题，与代码无关。可以用 `setarch $(uname -m) -R` 对单个进程关闭地址随机化来运行，不必修改系统设置。
 
 ---
 
@@ -940,8 +964,8 @@ v0.6 验证情况：
 
 | 阶段      | 目标                                              | 关键交付               |
 | ------- | ----------------------------------------------- | ------------------ |
-| M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**Windows 已完成**：代码与测试全部通过；**Linux 待验证**：epoll 路径尚未编译运行） |
-| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**Windows 已完成**；**Linux 待验证**） |
+| M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
+| M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer 已完成） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
