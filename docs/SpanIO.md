@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.13（设计草案，按 M1 实现修订）
+> 版本：v0.14（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.14 修订记录（2026-11-07）**：服务端超时与优雅关闭。
+> - 6.5：`tcp_server_options` 增加 `m_idle_timeout`（默认关闭）和 `m_close_timeout`（默认 30 秒），新增 `stop_gracefully(grace)`；新增错误码 `error::idle_timeout / close_timeout`。
+> - 6.5：逗留关闭：数据发完后先等对端关闭（最多 2 秒）再关闭 socket。修复了优雅关闭期间对端仍在发数据时，本端关闭触发 RST、对端丢失数据的问题（Linux 上稳定复现）。
+> - 6.7：`udp_server` 新增 `stop_gracefully(grace)`。
+> - 十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.13 修订记录（2026-11-07）**：完成 Linux 验证，M1 与 M2 在两个平台上完成。
 > - 新增 11.3：Linux 上的编译、测试、Sanitizer 与单文件编译结果。
@@ -522,7 +528,7 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
 | `tcp_server`           | 构造时完成绑定和监听，失败抛异常。`on_connect / on_message / on_close / set_framer` 须在启动前设置。`start()` 不阻塞，`run(n)` 阻塞且只能用于自带 context，`stop()` 可在任意线程调用 |
 | `tcp_connection`       | 由 `shared_ptr` 持有。`send()` 可在任意线程调用，内部排队；`close()` 发完再关，`abort()` 立即关；`context()` 用 `std::any` 挂业务数据 |
-| `tcp_server_options`   | 最大连接数、最大消息长度、发送队列字节上限、读缓冲大小                                                                        |
+| `tcp_server_options`   | 最大连接数、最大消息长度、发送队列字节上限、读缓冲大小、空闲超时、`close()` 超时                                                                        |
 | 分帧（`framing.h`）        | `line_framer()`、`length_prefix_framer()`、`encode_length_prefixed()`，也可传入任意函数对象                         |
 
 约定：
@@ -539,9 +545,21 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 | 写操作     | 不用 `async_write`，而是在连接锁内逐次 `async_write_some`：部分发送后继续时不能落到别的线程刚关闭的 socket 上。在途的队首数据等写操作返回后才释放                                  |
 | 内存安全    | 注册表持有 `weak_ptr`，连接持有共享状态，避免循环引用；外部 context 上 server 销毁后才运行的 handler 也是安全的                                                     |
 
+超时与关闭（v0.14）：
+
+| 功能                          | 约定                                                                                                  |
+| --------------------------- | --------------------------------------------------------------------------------------------------- |
+| 空闲超时 `m_idle_timeout`       | 默认关闭。连续这么久没有活动就关闭连接，`ec` 为 `error::idle_timeout`。“活动”指收到数据**或发送有进展**，所以只下载的客户端不会被误断                     |
+| `close()` 超时 `m_close_timeout` | 默认 30 秒。队列在时限内没发完就强制断开，`ec` 为 `error::close_timeout`；设为 0 表示一直等                                    |
+| `stop_gracefully(grace)`    | 立即停止接受，对每条连接 `close()`：不再投递 `on_message`，已排队数据发完再关；宽限期到了仍未关的强制断开（`close_timeout`），全部关闭后 `run()` 返回 |
+| `stop()`                    | 不变，立即关闭；宽限期内调用会立刻结束等待                                                                            |
+| 对端半关闭                       | 收到 EOF 时如果还有待发数据，同样受 `m_close_timeout` 限制                                                         |
+| 逗留关闭                        | 数据发完后只关闭发送方向，继续读取并丢弃对端发来的数据，等对端关闭后再关闭 socket，最多等 `close` 时限与 2 秒（`kLingerTimeout`）中较小者；到时直接关闭，`ec` 仍为空。原因：接收缓冲区里有未读数据时关闭 socket，系统会发 RST 而不是 FIN，对端可能丢掉刚发出的数据。因此 `close()` 后 `on_close` 要等对端关闭（正常客户端收到 FIN 会立即关闭），最多 2 秒 |
+
+实现：每条连接有一个空闲定时器和一个关闭定时器，访问都在连接锁内。空闲检测靠“最后活动时间”惰性重排：定时器到期时，如果期间有过活动就顺延到“最后活动时间 + 超时”，所以收发路径上只多一次原子写，不必每次重设定时器。连接关闭时取消两个定时器，因为挂起的等待会让连接一直存活，也会算作 `io_context` 的工作。
+
 限制：
 
-- `stop()` 立即关闭并丢弃未发送的数据。优雅关闭需要超时，要等 M3 的 `timer`；同样的原因，`close()` 遇到不读数据的对端时会一直等待，直到 `abort()` 或 `stop()`。空闲超时也在 M3 之后补充。
 - 一个 `tcp_server` 只能启动一次；`tcp_connection_ptr` 不能比 `tcp_server` 活得更久。
 
 示例 `examples/chat_server.cpp`（`chat_server [port] [threads]`，默认端口 9000）演示了在 `tcp_server` 上写一个完整服务：
@@ -623,7 +641,7 @@ server.run();                    // 阻塞到 stop()
 | 错误处理    | 回调异常和接收错误都只记录日志，继续接收，只有 `stop()` 才结束                                                         |
 | 生命周期    | 与 `tcp_server` 相同：构造时绑定，回调在启动前设置，只能启动一次，`run()` 只用于自带 context                                 |
 
-限制：`stop()` 立即停止并丢弃未发送的数据，优雅关闭要等 M3 的 `timer`。
+关闭：`stop()` 立即停止并丢弃未发送的数据。`stop_gracefully(grace)`（v0.14）立即停止接收、拒绝新的数据报，已排队的数据报继续发送，发完或宽限期到了再关闭；宽限期内调用 `stop()` 会立刻结束等待。
 
 `stats()` 返回 `udp_server_stats`，包含 `m_received / m_sent / m_queue_dropped / m_send_failed / m_truncated`。
 
@@ -873,6 +891,7 @@ spanio/
 │   ├── test_udp.cpp            # udp::socket 测试（已实现）
 │   ├── test_udp_server.cpp     # udp_server 与 UDP 回显示例测试（已实现）
 │   ├── test_timer.cpp          # steady_timer 测试（已实现）
+│   ├── test_server_timeouts.cpp # 服务端超时与优雅关闭测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -966,7 +985,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer 已完成） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭已完成） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 

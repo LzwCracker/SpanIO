@@ -41,7 +41,14 @@ enum misc_errors
     handler_failed,
     // udp::socket: a datagram was larger than the receive buffer; the part
     // that fit was delivered and the rest is lost
-    datagram_truncated
+    datagram_truncated,
+    // tcp_server: a connection had no activity (no data received and no
+    // send progress) for tcp_server_options::m_idle_timeout
+    idle_timeout,
+    // tcp_server: queued data could not be sent within the close limit
+    // (tcp_server_options::m_close_timeout, or the grace period of
+    // stop_gracefully), so the connection was closed without it
+    close_timeout
 };
 
 // Category of misc_errors
@@ -72,6 +79,10 @@ public:
             return "Malformed message framing";
         case datagram_truncated:
             return "Datagram truncated";
+        case idle_timeout:
+            return "Connection idle for too long";
+        case close_timeout:
+            return "Close timed out before all data was sent";
         case handler_failed:
             return "User callback failed";
         default:

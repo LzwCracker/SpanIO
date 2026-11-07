@@ -28,7 +28,8 @@
 //               on_close reports why the connection ended: empty for a local
 //               close(), abort() or stop(); error::eof when the peer closed;
 //               error::message_too_large, error::send_queue_full,
-//               error::framing_error or error::handler_failed when a limit
+//               error::framing_error, error::handler_failed,
+//               error::idle_timeout or error::close_timeout when a limit
 //               or callback ended it; otherwise the system error.
 //
 //               Without a framer, on_message gets whatever each read
@@ -37,11 +38,10 @@
 //               Rules:
 //               - Set callbacks and the framer before start() / run().
 //               - A server starts once; after stop(), create a new one.
-//               - stop() closes connections at once and drops unsent data.
-//                 A close that waits for a slow peer needs a timeout, which
-//                 needs timers (planned). For the same reason close() waits
-//                 for as long as a peer does not read, until abort() or
-//                 stop().
+//               - stop() closes connections at once and drops unsent data;
+//                 stop_gracefully(grace) lets them send what is queued first.
+//               - close() waits for queued data at most m_close_timeout, and
+//                 m_idle_timeout (off by default) closes silent connections.
 //               - A tcp_connection_ptr must not outlive its tcp_server.
 // Developer:    lzwcracker@gmail.com
 // Date:         2026-11-05
@@ -56,10 +56,13 @@
 #include "spanio/io_context.h"
 #include "spanio/ip.h"
 #include "spanio/tcp.h"
+#include "spanio/timer.h"
 #include "spanio/detail/platform.h"
 #include "spanio/detail/run_threads.h"
 
 #include <any>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -88,6 +91,16 @@ constexpr std::size_t kDefaultMaxSendQueueBytes = 16 * 1024 * 1024;
 // Default size of each connection's read buffer: 64 KiB
 constexpr std::size_t kDefaultReadBufferSize = 64 * 1024;
 
+// Idle timeout used unless set: off
+constexpr std::chrono::milliseconds kDefaultIdleTimeout(0);
+
+// Longest a close() waits for queued data unless set: 30 seconds
+constexpr std::chrono::milliseconds kDefaultCloseTimeout(30000);
+
+// Longest a connection waits for the peer to close after everything was
+// sent, before closing anyway (see tcp_connection::finish_flush_locked)
+constexpr std::chrono::milliseconds kLingerTimeout(2000);
+
 // Limits of a tcp_server
 struct tcp_server_options
 {
@@ -102,6 +115,14 @@ struct tcp_server_options
     std::size_t m_max_send_queue_bytes = kDefaultMaxSendQueueBytes;
     // Bytes read from a socket at a time; must not be 0
     std::size_t m_read_buffer_size = kDefaultReadBufferSize;
+    // Close a connection that had no activity for this long: no data
+    // received and no send progress, so a client that only downloads is not
+    // idle. on_close gets error::idle_timeout. 0 turns it off.
+    std::chrono::milliseconds m_idle_timeout = kDefaultIdleTimeout;
+    // Longest a close() may wait for queued data to go out; after that the
+    // connection is closed without it and on_close gets error::close_timeout.
+    // 0 waits for as long as it takes.
+    std::chrono::milliseconds m_close_timeout = kDefaultCloseTimeout;
 };
 
 class tcp_connection;
@@ -270,12 +291,42 @@ private:
     // Parameter reason: the reason
     void record_reason_locked(const std::error_code& reason);
 
-    // Everything queued was sent: shut down sending and close. Caller holds
-    // m_mutex.
-    void finish_flush_locked();
+    // Everything queued was sent: shut down sending, then keep reading (and
+    // discarding) until the peer closes too, at most the linger limit.
+    // Closing while received data is still unread would make the system send
+    // RST instead of FIN, and the peer could lose the data just sent. Caller
+    // holds m_mutex.
+    // Parameter limit: close limit in effect; the linger wait is the smaller
+    //                  of it and kLingerTimeout (0 means kLingerTimeout)
+    void finish_flush_locked(std::chrono::milliseconds limit);
 
     // Close the socket and drop queued data. Caller holds m_mutex.
     void close_socket_locked();
+
+    // Like close(), with a given limit for sending what is queued. If the
+    // connection is already closing, only an earlier deadline is applied.
+    // Parameter limit: longest wait; 0 waits for as long as it takes
+    void close_within(std::chrono::milliseconds limit);
+
+    // Start or move the close deadline. Caller holds m_mutex.
+    // Parameter limit: time from now; 0 sets no deadline
+    void arm_close_timer_locked(std::chrono::milliseconds limit);
+
+    // Close deadline reached: give up on the queued data
+    // Parameter ec: wait result; cancelled when the close finished in time
+    void on_close_timer(const std::error_code& ec);
+
+    // Wait for the idle deadline. Caller holds m_mutex.
+    // Parameter deadline: when the connection counts as idle
+    void wait_for_idle_locked(steady_timer::time_point deadline);
+
+    // Idle deadline reached: close, unless there was activity since it was
+    // set, in which case wait again from the last activity
+    // Parameter ec: wait result; cancelled once the connection closed
+    void on_idle_timer(const std::error_code& ec);
+
+    // Remember that the connection was active now, for the idle timeout
+    void note_activity() noexcept;
 
     // Run on_close if the read chain has ended and no write is in flight
     void try_finish();
@@ -312,6 +363,18 @@ private:
     std::vector<char> m_read_buffer;
     // Bytes waiting for the framer to find a complete message
     std::string m_input;
+    // Ends an idle connection; guarded by m_mutex like the socket
+    steady_timer m_idle_timer;
+    // Ends a close() that waits too long for queued data; guarded by m_mutex
+    steady_timer m_close_timer;
+    // m_close_timer has a wait pending
+    bool m_close_timer_armed;
+    // Everything queued was sent and sending is shut down; the connection
+    // only waits for the peer to close
+    bool m_flushed;
+    // Time of the last data received or sent, as steady_clock ticks; written
+    // without m_mutex by the read and write paths
+    std::atomic<steady_timer::clock::rep> m_last_activity;
     // User data; see context()
     std::any m_context;
 };
@@ -374,8 +437,31 @@ public:
         }
     }
 
+    // Stop accepting and close() every connection, giving them a limited
+    // time to send what is queued
+    // Parameter grace: longest wait; 0 waits for as long as it takes
+    void stop_gracefully(std::chrono::milliseconds grace)
+    {
+        std::vector<tcp_connection_ptr> live = stop_accepting();
+        for (const tcp_connection_ptr& connection : live)
+        {
+            connection->close_within(grace);
+        }
+    }
+
     // Stop accepting and close every connection at once
     void stop()
+    {
+        std::vector<tcp_connection_ptr> live = stop_accepting();
+        for (const tcp_connection_ptr& connection : live)
+        {
+            connection->abort();
+        }
+    }
+
+    // Close the acceptor and collect the connections still alive
+    // Return value: the connections
+    std::vector<tcp_connection_ptr> stop_accepting()
     {
         std::vector<tcp_connection_ptr> live;
         {
@@ -392,10 +478,7 @@ public:
                 }
             }
         }
-        for (const tcp_connection_ptr& connection : live)
-        {
-            connection->abort();
-        }
+        return live;
     }
 
     // Whether start() was called
@@ -565,12 +648,27 @@ inline tcp_connection::tcp_connection(std::shared_ptr<detail::tcp_server_state> 
     , m_close_fired(false)
     , m_has_reason(false)
     , m_read_buffer(m_state->m_options.m_read_buffer_size)
+    , m_idle_timer(m_socket.context())
+    , m_close_timer(m_socket.context())
+    , m_close_timer_armed(false)
+    , m_flushed(false)
+    , m_last_activity(steady_timer::clock::now().time_since_epoch().count())
 {
 }
 
 inline void tcp_connection::close()
 {
+    close_within(m_state->m_options.m_close_timeout);
+}
+
+inline void tcp_connection::close_within(std::chrono::milliseconds limit)
+{
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_phase == phase::kClosing)
+    {
+        arm_close_timer_locked(limit);
+        return;
+    }
     if (m_phase != phase::kOpen)
     {
         return;
@@ -579,10 +677,102 @@ inline void tcp_connection::close()
     if (m_writing)
     {
         m_phase = phase::kClosing;
+        arm_close_timer_locked(limit);
     }
     else
     {
-        finish_flush_locked();
+        finish_flush_locked(limit);
+    }
+}
+
+inline void tcp_connection::arm_close_timer_locked(std::chrono::milliseconds limit)
+{
+    if (limit.count() <= 0)
+    {
+        return;
+    }
+    const steady_timer::time_point deadline = steady_timer::clock::now() + limit;
+    if (m_close_timer_armed && deadline >= m_close_timer.expiry())
+    {
+        return;
+    }
+    // Moving the deadline cancels the earlier wait; its handler then sees
+    // operation_canceled and does nothing
+    m_close_timer.expires_at(deadline);
+    tcp_connection_ptr self = shared_from_this();
+    auto close_deadline = [self](std::error_code ec)
+    {
+        self->on_close_timer(ec);
+    };
+    m_close_timer.async_wait(close_deadline);
+    m_close_timer_armed = true;
+}
+
+inline void tcp_connection::on_close_timer(const std::error_code& ec)
+{
+    if (ec)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_close_timer_armed = false;
+    if (m_phase != phase::kClosing)
+    {
+        return;
+    }
+    if (m_flushed)
+    {
+        // Everything was sent; only the peer's close did not come in time.
+        // That is not a failure, so the recorded reason stays.
+        close_socket_locked();
+        return;
+    }
+    // Overrides the reason close() recorded: the data was not all sent
+    m_close_reason = make_error_code(error::close_timeout);
+    m_has_reason = true;
+    detail::log_error("tcp_server: close timed out", m_close_reason);
+    close_socket_locked();
+}
+
+inline void tcp_connection::wait_for_idle_locked(steady_timer::time_point deadline)
+{
+    m_idle_timer.expires_at(deadline);
+    tcp_connection_ptr self = shared_from_this();
+    auto idle_deadline = [self](std::error_code ec)
+    {
+        self->on_idle_timer(ec);
+    };
+    m_idle_timer.async_wait(idle_deadline);
+}
+
+inline void tcp_connection::on_idle_timer(const std::error_code& ec)
+{
+    if (ec)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_phase != phase::kOpen)
+    {
+        return;
+    }
+    // The timer is not moved on every read or write; it is checked here
+    // against the last activity instead, which keeps the I/O paths cheap
+    const steady_timer::time_point last(steady_timer::duration(m_last_activity.load()));
+    const steady_timer::time_point deadline = last + m_state->m_options.m_idle_timeout;
+    if (steady_timer::clock::now() >= deadline)
+    {
+        fail_locked(error::idle_timeout);
+        return;
+    }
+    wait_for_idle_locked(deadline);
+}
+
+inline void tcp_connection::note_activity() noexcept
+{
+    if (m_state->m_options.m_idle_timeout.count() > 0)
+    {
+        m_last_activity.store(steady_timer::clock::now().time_since_epoch().count());
     }
 }
 
@@ -604,6 +794,16 @@ inline void tcp_connection::begin()
             detail::log_error("tcp_server: on_connect threw an exception",
                               make_error_code(error::handler_failed));
             fail(error::handler_failed);
+        }
+    }
+    const std::chrono::milliseconds idle = m_state->m_options.m_idle_timeout;
+    if (idle.count() > 0)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_phase == phase::kOpen)
+        {
+            note_activity();
+            wait_for_idle_locked(steady_timer::clock::now() + idle);
         }
     }
     continue_reading();
@@ -661,6 +861,7 @@ inline void tcp_connection::on_read(std::error_code ec, std::size_t bytes)
         handle_read_end(ec);
         return;
     }
+    note_activity();
     deliver(bytes);
     continue_reading();
 }
@@ -678,6 +879,7 @@ inline void tcp_connection::handle_read_end(const std::error_code& ec)
             if (ec == error::eof && m_writing)
             {
                 m_phase = phase::kClosing;
+                arm_close_timer_locked(m_state->m_options.m_close_timeout);
             }
             else
             {
@@ -793,6 +995,7 @@ inline void tcp_connection::on_written(std::error_code ec, std::size_t bytes)
         }
         else
         {
+            note_activity();
             m_write_offset += bytes;
             if (m_write_offset == m_send_queue.front().size())
             {
@@ -808,7 +1011,7 @@ inline void tcp_connection::on_written(std::error_code ec, std::size_t bytes)
             }
             if (m_phase == phase::kClosing)
             {
-                finish_flush_locked();
+                finish_flush_locked(m_state->m_options.m_close_timeout);
             }
         }
     }
@@ -840,14 +1043,26 @@ inline void tcp_connection::record_reason_locked(const std::error_code& reason)
     }
 }
 
-inline void tcp_connection::finish_flush_locked()
+inline void tcp_connection::finish_flush_locked(std::chrono::milliseconds limit)
 {
     const std::error_code ec = m_socket.shutdown(tcp::shutdown_send);
     if (ec)
     {
         detail::log_error("tcp_server: shutdown", ec);
     }
-    close_socket_locked();
+    // Nothing left to wait for when the peer already closed or the
+    // connection is broken
+    if (m_read_done || ec)
+    {
+        close_socket_locked();
+        return;
+    }
+    // The read chain keeps running and discards what arrives; its end of
+    // file closes the socket (handle_read_end)
+    m_phase = phase::kClosing;
+    m_flushed = true;
+    const bool use_limit = limit.count() > 0 && limit < kLingerTimeout;
+    arm_close_timer_locked(use_limit ? limit : kLingerTimeout);
 }
 
 inline void tcp_connection::close_socket_locked()
@@ -864,6 +1079,11 @@ inline void tcp_connection::close_socket_locked()
         m_send_queue.clear();
     }
     m_socket.close();
+    // Pending timer waits keep the connection alive and count as work, so
+    // they must end with the connection
+    m_idle_timer.cancel();
+    m_close_timer.cancel();
+    m_close_timer_armed = false;
 }
 
 inline void tcp_connection::try_finish()
@@ -995,6 +1215,18 @@ public:
     void stop()
     {
         m_state->stop();
+    }
+
+    // Stop accepting at once, and close() every connection: no further
+    // on_message, queued data is still sent. Connections not closed within
+    // the grace period are closed without their data (on_close gets
+    // error::close_timeout). run() returns once all of them have closed.
+    // Does not block; safe from any thread and from callbacks. A later
+    // stop() ends the wait at once.
+    // Parameter grace: longest wait; 0 waits for as long as it takes
+    void stop_gracefully(std::chrono::milliseconds grace)
+    {
+        m_state->stop_gracefully(grace);
     }
 
     // Address the server listens on, e.g. to learn the port picked for 0

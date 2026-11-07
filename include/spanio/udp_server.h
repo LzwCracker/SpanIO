@@ -36,8 +36,8 @@
 //               Rules:
 //               - Set on_datagram before start() / run().
 //               - A server starts once; after stop(), create a new one.
-//               - stop() drops queued data. Waiting for it needs a timeout,
-//                 which needs timers (planned).
+//               - stop() drops queued data; stop_gracefully(grace) stops
+//                 receiving but sends what is queued first.
 // Developer:    lzwcracker@gmail.com
 // Date:         2026-11-06
 // ============================================================================
@@ -49,11 +49,13 @@
 #include "spanio/error.h"
 #include "spanio/io_context.h"
 #include "spanio/ip.h"
+#include "spanio/timer.h"
 #include "spanio/udp.h"
 #include "spanio/detail/platform.h"
 #include "spanio/detail/run_threads.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -135,6 +137,8 @@ public:
         , m_writing(false)
         , m_started(false)
         , m_stopped(false)
+        , m_closed(false)
+        , m_grace_timer(context)
         , m_received(0)
         , m_sent(0)
         , m_queue_dropped(0)
@@ -176,8 +180,19 @@ public:
         }
     }
 
-    // Close the socket and drop queued data
+    // Close the socket and drop queued data; also ends a graceful stop
     void stop()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_stopped = true;
+        close_now_locked();
+    }
+
+    // Stop receiving and refuse new datagrams at once, but keep sending
+    // those already queued, then close
+    // Parameter grace: longest wait for the queue to empty; 0 waits for as
+    //                  long as it takes
+    void stop_gracefully(std::chrono::milliseconds grace)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_stopped)
@@ -185,17 +200,21 @@ public:
             return;
         }
         m_stopped = true;
-        if (m_writing)
+        if (!m_writing)
         {
-            // The kernel may still read the element in flight; it is freed
-            // when its send comes back
-            m_send_queue.erase(m_send_queue.begin() + 1, m_send_queue.end());
+            close_now_locked();
+            return;
         }
-        else
+        if (grace.count() > 0)
         {
-            m_send_queue.clear();
+            m_grace_timer.expires_after(grace);
+            std::shared_ptr<udp_server_state> self = shared_from_this();
+            auto grace_over = [self](std::error_code ec)
+            {
+                self->on_grace_over(ec);
+            };
+            m_grace_timer.async_wait(grace_over);
         }
-        m_socket.close();
     }
 
     // Throw unless the callback may still be changed
@@ -287,6 +306,15 @@ private:
         {
             return;
         }
+        {
+            // A graceful stop delivers nothing more, even a datagram that
+            // was already on its way
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stopped)
+            {
+                return;
+            }
+        }
         if (ec == error::datagram_truncated)
         {
             ++m_truncated;
@@ -341,7 +369,7 @@ private:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_writing = false;
-        if (m_stopped)
+        if (m_closed)
         {
             m_send_queue.clear();
             return;
@@ -362,6 +390,50 @@ private:
             m_writing = true;
             send_next_locked();
         }
+        else if (m_stopped)
+        {
+            // A graceful stop was waiting for the queue to empty
+            close_now_locked();
+        }
+    }
+
+    // The grace period of a graceful stop ended with data still queued
+    // Parameter ec: wait result; cancelled when the queue emptied in time
+    void on_grace_over(const std::error_code& ec)
+    {
+        if (ec)
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_closed)
+        {
+            log_error("udp_server: graceful stop timed out", make_error_code(error::close_timeout));
+            close_now_locked();
+        }
+    }
+
+    // Close the socket, drop queued data and end the grace period. Caller
+    // holds m_mutex.
+    void close_now_locked()
+    {
+        if (m_closed)
+        {
+            return;
+        }
+        m_closed = true;
+        if (m_writing)
+        {
+            // The kernel may still read the element in flight; it is freed
+            // when its send comes back
+            m_send_queue.erase(m_send_queue.begin() + 1, m_send_queue.end());
+        }
+        else
+        {
+            m_send_queue.clear();
+        }
+        m_socket.close();
+        m_grace_timer.cancel();
     }
 
     // Guards the socket, the queue and the flags below it
@@ -379,8 +451,13 @@ private:
     bool m_writing;
     // start() was called
     bool m_started;
-    // stop() was called
+    // stop() or stop_gracefully() was called: no more receiving or new
+    // datagrams
     bool m_stopped;
+    // The socket is closed
+    bool m_closed;
+    // Ends the grace period of stop_gracefully()
+    steady_timer m_grace_timer;
     // See udp_server_stats::m_received
     std::atomic<std::uint64_t> m_received;
     // See udp_server_stats::m_sent
@@ -510,6 +587,16 @@ public:
     void stop()
     {
         m_state->stop();
+    }
+
+    // Stop receiving and refuse new datagrams at once, but keep sending the
+    // queued ones; close when the queue is empty or the grace period ends,
+    // and run() then returns. Does not block; safe from any thread and from
+    // on_datagram. A later stop() ends the wait at once.
+    // Parameter grace: longest wait; 0 waits for as long as it takes
+    void stop_gracefully(std::chrono::milliseconds grace)
+    {
+        m_state->stop_gracefully(grace);
     }
 
     // Address the server is bound to, e.g. to learn the port picked for 0

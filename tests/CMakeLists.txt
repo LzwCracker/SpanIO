@@ -21,11 +21,12 @@ set(SPANIO_TEST_NAMES
     test_udp
     test_udp_server
     test_timer
+    test_server_timeouts
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
     add_executable(${test_name} ${test_name}.cpp test_framework.h test_net_helpers.h
-        test_proactor_backends.h)
+        test_proactor_backends.h test_proactor_decorators.h)
     target_link_libraries(${test_name} PRIVATE spanio::spanio)
     target_compile_options(${test_name} PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX /permissive- /utf-8>
