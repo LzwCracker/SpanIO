@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.15（设计草案，按 M1 实现修订）
+> 版本：v0.16（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.16 修订记录（2026-11-08）**：实现 strand，M3 的功能全部完成。
+> - 6.4：补全 `strand`、`make_strand`、`bind_executor` 的接口与语义；新增 6.4.1 测试说明。
+> - 十 / 十二：同步工程结构和 M3 进度（剩 API 冻结与文档收尾）。
 >
 > **v0.15 修订记录（2026-11-08）**：实现域名解析。
 > - 新增 6.9：`tcp::resolver / udp::resolver`、`resolve_options` 和 `tcp::async_connect`；新增错误类别 `spanio.netdb`。
@@ -499,18 +503,54 @@ sock.async_read_some(spanio::buffer(buf), on_read);
 
 三者共享同一套底层完成事件，**只是完成令牌（CompletionToken）不同**，无需重复实现逻辑。
 
-### 6.4 Strand：无锁串行化
+### 6.4 Strand：用户免加锁的串行化（v0.16 实现）
 
-多线程 `run()` 下，为避免用户对共享状态加锁，提供 `strand`：
+多线程 `run()` 下，为避免用户对共享状态加锁，提供 `strand`（`include/spanio/strand.h`）：
 
 ```cpp
-spanio::strand<io_context::executor_type> s = spanio::make_strand(ctx);
-sock.async_read(buf, spanio::bind_executor(s, [](std::error_code, std::size_t) {
+spanio::strand<spanio::io_context::executor_type> s = spanio::make_strand(ctx);
+auto on_read = [&](std::error_code ec, std::size_t n)
+{
     // 绑定到同一 strand 的 handler 绝不会并发执行，无需加锁
-}));
+};
+sock.async_read_some(spanio::buffer(buf), spanio::bind_executor(s, on_read));
 ```
 
 strand 保证“逻辑单线程、物理多核利用”，是并发安全的核心工具。
+
+**接口**
+
+| 接口 | 说明 |
+|---|---|
+| `make_strand(ctx)` / `make_strand(executor)` | 新建一个独立的串行域 |
+| `strand::post(h)` | 排入 strand 队列，永不在调用处执行 |
+| `strand::dispatch(h)` | 当前线程正在执行本 strand 的回调，或在本 context 的 `run()` 中且 strand 空闲时，就地执行；否则同 `post` |
+| `strand::running_in_this_thread()` | 当前线程是否正在执行本 strand 的回调（嵌套时外层 strand 也为 true） |
+| `get_inner_executor()` / `context()` / `==` / `!=` | 底层执行器、所属 context；副本之间相等 |
+| `bind_executor(ex, h)` | 返回 `executor_binder`：操作完成时保存参数（decay 拷贝或移动），再 `ex.dispatch()` 调用 `h`；参数以右值传入，可接收 `tcp::socket` 这类只能移动的值 |
+
+**语义**
+
+- `strand` 是可拷贝的轻量对象，内部用 `shared_ptr` 指向同一个 `detail::strand_impl`（互斥锁 + 回调队列 + “被占用”标志）。副本共享串行域，每次 `make_strand` 是新的域。
+- 同一 strand 的回调同一时刻至多一个在执行，按入队顺序执行；回调之间经互斥锁同步，前一个回调写入的数据对后一个可见。不同 strand 之间并行。
+- 执行方式：strand 空闲时，入队的同时向 `io_context` 投递**一个**执行任务（`strand_invoker`）。它执行队首回调后，若队列非空就投递下一个执行任务，否则释放 strand。每个回调都是 `io_context` 的一个独立 handler：计入工作量，`run()` 的返回值也按回调计数；不会长时间独占一个线程。
+- 没有排队回调的 strand 不算工作量，不会让 `run()` 不返回。
+- 回调抛异常：先把 strand 交给下一个执行任务（或释放），再让异常从 `run()` 抛出；剩余回调保持顺序，下次 `run()` 继续执行。经 `detail::log_error` 记录。
+- `io_context` 析构时，未执行的 strand 执行任务被销毁，并带走队列里的回调（销毁、不调用），不等到最后一个 strand 副本析构。strand 副本可以比 context 活得久，但之后不能再使用。
+- `io_context`、I/O 对象和两个 server 均无需改动：`bind_executor` 返回的只是一个普通的完成回调。
+
+---
+
+### 6.4.1 Strand 测试（v0.16）
+
+`tests/test_strand.cpp` 共 16 个用例；涉及 TCP 的用例在平台的每个 proactor 后端上各跑一遍。
+
+| 分组 | 用例 |
+|---|---|
+| 基本语义 | `post_not_inline`、`fifo_order`、`no_concurrency`（4 个线程投递、4 个线程 `run()`、2 万个回调）、`strands_run_in_parallel`、`copies_share_domain` |
+| `dispatch` 与 `running_in_this_thread` | `dispatch_inline_inside_strand`、`dispatch_outside_run_queues`、`dispatch_from_context_handler`、`post_inside_strand_runs_after`、`nested_strands` |
+| 工作量、异常与销毁 | `work_counting`、`handler_exception`、`destroy_with_pending` |
+| `bind_executor` 与 I/O | `bind_timer`（200 个计时器 + 1 个取消）、`bind_tcp_io`（1 MB 回显，读写回调与额外投递的回调都在同一 strand）、`bind_move_only_and_cancel` |
 
 ---
 
@@ -901,7 +941,7 @@ spanio/
 │       ├── spanio.h                # 总入口
 │       ├── io_context.h            # 执行引擎：事件循环、任务队列、executor、work guard（已实现）
 │       ├── executor.h              # 执行器抽象
-│       ├── strand.h                # 串行化域
+│       ├── strand.h                # 串行化域 strand、make_strand、bind_executor（已实现）
 │       ├── error.h                 # SpanIO 自有错误码（error::eof）（已实现）
 │       ├── buffer.h                # 缓冲区抽象 mutable_buffer / const_buffer（已实现）
 │       ├── ip.h                    # ip::address、ipv4 / ipv6 常用地址（已实现）
@@ -947,6 +987,7 @@ spanio/
 │   ├── test_timer.cpp          # steady_timer 测试（已实现）
 │   ├── test_server_timeouts.cpp # 服务端超时与优雅关闭测试（已实现）
 │   ├── test_resolver.cpp       # 域名解析测试（已实现）
+│   ├── test_strand.cpp         # strand 与 bind_executor 测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -1040,7 +1081,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver 已完成，strand 待做） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand 已完成；剩 API 冻结与文档收尾） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 
