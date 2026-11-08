@@ -22,6 +22,7 @@ set(SPANIO_TEST_NAMES
     test_udp_server
     test_timer
     test_server_timeouts
+    test_resolver
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)

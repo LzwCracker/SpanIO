@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.14（设计草案，按 M1 实现修订）
+> 版本：v0.15（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.15 修订记录（2026-11-08）**：实现域名解析。
+> - 新增 6.9：`tcp::resolver / udp::resolver`、`resolve_options` 和 `tcp::async_connect`；新增错误类别 `spanio.netdb`。
+> - 十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.14 修订记录（2026-11-07）**：服务端超时与优雅关闭。
 > - 6.5：`tcp_server_options` 增加 `m_idle_timeout`（默认关闭）和 `m_close_timeout`（默认 30 秒），新增 `stop_gracefully(grace)`；新增错误码 `error::idle_timeout / close_timeout`。
@@ -691,6 +695,56 @@ public:
 - 每取一个 handler 前都检查到期，持续有 handler 排队时定时器也不会被饿死，代价是多读一次时钟。
 - 到期的等待转成普通 handler 进入任务队列，之后的调度与其他 handler 相同。
 
+### 6.9 域名解析 resolver（v0.15）
+
+实现见 `include/spanio/resolver.h`。
+
+```cpp
+namespace spanio {
+
+enum class resolve_family { any, v4, v6 };
+
+struct resolve_options
+{
+    resolve_family m_family = resolve_family::any;
+    bool m_numeric_host = false;      // 主机必须是 IP 字面量，不发 DNS 查询
+    bool m_numeric_service = false;   // 服务必须是端口号
+};
+
+}
+
+namespace spanio { namespace tcp {     // udp::resolver 相同，只是 SOCK_DGRAM
+
+class resolver
+{
+public:
+    explicit resolver(io_context& ctx);
+    std::vector<endpoint> resolve(std::string_view host, std::string_view service,
+                                  std::error_code& ec, const resolve_options& options = {});
+    template <typename H>
+    void async_resolve(std::string_view host, std::string_view service, H&& h,
+                       const resolve_options& options = {});   // h(ec, std::vector<endpoint>)
+    void cancel();
+};
+
+template <typename H>
+void async_connect(socket& sock, std::vector<endpoint> endpoints, H&& h);  // h(ec, const endpoint&)
+
+}}
+```
+
+| 约定            | 内容                                                                                                       |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| 实现            | **两个平台相同**：每个 `resolver` 有一个工作线程（首次使用时创建），在线程里阻塞调用 `getaddrinfo`，结果投递回 `io_context`。没有用 Windows 的 `GetAddrInfoExW`，因为 Linux 没有对应的异步接口，统一实现才能保证行为一致 |
+| 并发            | 同一个 `resolver` 的请求串行处理；需要并行就创建多个 `resolver`                                                                  |
+| 回调            | 在 `run()` 中执行，从不内联，恰好一次；挂起的请求算作工作                                                                         |
+| 结果            | 保持系统返回的顺序（RFC 6724 排序），去掉重复项；`service` 可以是端口号或服务名                                                        |
+| 错误            | 新类别 `spanio.netdb`：`host_not_found / host_not_found_try_again / no_data / no_recovery / service_not_found`，两个平台的 `getaddrinfo` 返回码都映射到这里 |
+| 取消            | 立即以 `operation_canceled` 回调。正在进行的系统查询无法中断，结果到达后直接丢弃；因此析构时要等当前查询结束，DNS 慢时可能要几秒                                 |
+| `async_connect` | 按顺序逐个尝试，成功即停；每次尝试前重新打开 socket（地址族可能不同）；全部失败报最后一个错误，空列表报 `host_not_found`。典型场景：`localhost` 先得到 `::1`，而服务器只监听 IPv4，会自动改连 `127.0.0.1` |
+
+测试通过一个内部构造函数替换解析函数，模拟慢查询，所以取消和析构的用例不依赖真实网络的时序。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -857,7 +911,7 @@ spanio/
 │       ├── udp.h                   # UDP 接口：udp::socket（已实现）
 │       ├── udp_server.h            # 高层 UDP 服务端：udp_server（已实现）
 │       ├── timer.h                 # 定时器 steady_timer（已实现）
-│       ├── resolver.h              # 域名解析
+│       ├── resolver.h              # 域名解析与 async_connect（已实现）
 │       └── detail/
 │           ├── platform.h          # 平台宏与类型别名（已实现）
 │           ├── socket_ops.h        # socket 生命周期封装（已实现）
@@ -892,6 +946,7 @@ spanio/
 │   ├── test_udp_server.cpp     # udp_server 与 UDP 回显示例测试（已实现）
 │   ├── test_timer.cpp          # steady_timer 测试（已实现）
 │   ├── test_server_timeouts.cpp # 服务端超时与优雅关闭测试（已实现）
+│   ├── test_resolver.cpp       # 域名解析测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -985,7 +1040,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭已完成） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver 已完成，strand 待做） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 

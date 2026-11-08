@@ -3,6 +3,10 @@
 //               plugged into the std::error_code machinery. System errors
 //               keep their std::system_category codes; cancellation is always
 //               std::errc::operation_canceled (see io_proactor.h).
+//               - misc_errors (category "spanio.misc"): eof and the
+//                 tcp_server / udp::socket conditions
+//               - netdb_errors (category "spanio.netdb"): name resolution
+//                 failures reported by resolver.h
 // Usage:        sock.async_read_some(buf, handler);
 //               ...
 //               if (ec == spanio::error::eof)
@@ -108,6 +112,73 @@ inline std::error_code make_error_code(misc_errors value) noexcept
     return std::error_code(static_cast<int>(value), misc_category());
 }
 
+// Name resolution errors (resolver.h), the same on every platform. The
+// getaddrinfo() codes of each system are mapped onto these.
+enum netdb_errors
+{
+    // The host name is not known
+    host_not_found = 1,
+    // The host name could not be resolved now (for example no DNS server
+    // answered); trying again later may work
+    host_not_found_try_again,
+    // The host name is valid but has no address of the requested family
+    no_data,
+    // A non-recoverable error occurred during resolution
+    no_recovery,
+    // The service name is not known for this socket type
+    service_not_found
+};
+
+// Category of netdb_errors
+class netdb_category_impl : public std::error_category
+{
+public:
+    // Name of the category
+    // Return value: static string "spanio.netdb"
+    const char* name() const noexcept override
+    {
+        return "spanio.netdb";
+    }
+
+    // Human-readable description of an error value
+    // Parameter value: a netdb_errors value
+    // Return value: description text
+    std::string message(int value) const override
+    {
+        switch (value)
+        {
+        case host_not_found:
+            return "Host not found";
+        case host_not_found_try_again:
+            return "Host not found, try again later";
+        case no_data:
+            return "Host has no address of the requested type";
+        case no_recovery:
+            return "Non-recoverable name resolution failure";
+        case service_not_found:
+            return "Service not found";
+        default:
+            return "spanio.netdb error";
+        }
+    }
+};
+
+// The single instance of the netdb category
+// Return value: reference to the category, valid for the whole program
+inline const std::error_category& netdb_category() noexcept
+{
+    static const netdb_category_impl s_category;
+    return s_category;
+}
+
+// Make an error_code from a netdb_errors value
+// Parameter value: the error
+// Return value: the error code in the netdb category
+inline std::error_code make_error_code(netdb_errors value) noexcept
+{
+    return std::error_code(static_cast<int>(value), netdb_category());
+}
+
 }}
 
 namespace std {
@@ -115,6 +186,12 @@ namespace std {
 // Lets misc_errors convert implicitly to std::error_code
 template <>
 struct is_error_code_enum<spanio::error::misc_errors> : true_type
+{
+};
+
+// Lets netdb_errors convert implicitly to std::error_code
+template <>
+struct is_error_code_enum<spanio::error::netdb_errors> : true_type
 {
 };
 

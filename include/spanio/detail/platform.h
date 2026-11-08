@@ -68,6 +68,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+// getaddrinfo() and its EAI_ codes, for resolver.h
+#include <netdb.h>
 
 #endif
 
