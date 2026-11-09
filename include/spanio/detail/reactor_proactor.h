@@ -447,7 +447,7 @@ private:
             }
             else
             {
-                op.m_ec = std::error_code(error, std::system_category());
+                op.m_ec = normalize_error(std::error_code(error, std::system_category()));
             }
             if (op.m_ec)
             {

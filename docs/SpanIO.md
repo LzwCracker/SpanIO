@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.16（设计草案，按 M1 实现修订）
+> 版本：v0.17（设计草案，按 M1 实现修订）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.17 修订记录（2026-11-09）**：统一错误码。
+> - 新增 6.10：错误码一览；所有系统错误经 `detail::normalize_error()` 统一，Windows 的 `WSAESHUTDOWN / WSAENOTSOCK / ERROR_NETNAME_DELETED / ERROR_CONNECTION_REFUSED` 转为对应的 `std::errc`。
+> - 6.9：修复 `tcp::async_connect` 在取消或关闭 socket 后仍重新打开 socket 尝试下一个地址的问题。
+> - 十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.16 修订记录（2026-11-08）**：实现 strand，M3 的功能全部完成。
 > - 6.4：补全 `strand`、`make_strand`、`bind_executor` 的接口与语义；新增 6.4.1 测试说明。
@@ -781,9 +786,54 @@ void async_connect(socket& sock, std::vector<endpoint> endpoints, H&& h);  // h(
 | 结果            | 保持系统返回的顺序（RFC 6724 排序），去掉重复项；`service` 可以是端口号或服务名                                                        |
 | 错误            | 新类别 `spanio.netdb`：`host_not_found / host_not_found_try_again / no_data / no_recovery / service_not_found`，两个平台的 `getaddrinfo` 返回码都映射到这里 |
 | 取消            | 立即以 `operation_canceled` 回调。正在进行的系统查询无法中断，结果到达后直接丢弃；因此析构时要等当前查询结束，DNS 慢时可能要几秒                                 |
-| `async_connect` | 按顺序逐个尝试，成功即停；每次尝试前重新打开 socket（地址族可能不同）；全部失败报最后一个错误，空列表报 `host_not_found`。典型场景：`localhost` 先得到 `::1`，而服务器只监听 IPv4，会自动改连 `127.0.0.1` |
+| `async_connect` | 按顺序逐个尝试，成功即停；每次尝试前重新打开 socket（地址族可能不同）；全部失败报最后一个错误，空列表报 `host_not_found`；取消或关闭 socket 时立即以 `operation_canceled` 结束，不再尝试后面的地址（v0.17 修复）。典型场景：`localhost` 先得到 `::1`，而服务器只监听 IPv4，会自动改连 `127.0.0.1` |
 
 测试通过一个内部构造函数替换解析函数，模拟慢查询，所以取消和析构的用例不依赖真实网络的时序。
+
+### 6.10 错误码一览（v0.17）
+
+所有错误都以 `std::error_code` 交给回调，分三类：
+
+| 类别 | 内容 | 判断方式 |
+|---|---|---|
+| 系统错误（`std::system_category` / `generic`） | 操作系统报告的错误 | `ec == std::errc::xxx` |
+| `spanio.misc` | SpanIO 自己判定的情况 | `ec == spanio::error::eof` 等 |
+| `spanio.netdb` | 域名解析失败 | `ec == spanio::error::host_not_found` 等 |
+
+**平台统一**：所有系统错误都经过 `detail::normalize_error()`（`socket_ops.h`）。Linux 的 `errno` 本来就能与 `std::errc` 比较，原样保留；Windows 上 C++ 标准库认不出的几个码被转换：
+
+| Windows 原始码 | 转换为 | 出现场景 |
+|---|---|---|
+| `WSA_OPERATION_ABORTED` | `operation_canceled` | 取消（Linux 的 `ECANCELED` 同样转换） |
+| `WSAESHUTDOWN` | `broken_pipe` | 本端 `shutdown(发送)` 后再写，与 Linux 的 `EPIPE` 一致 |
+| `WSAENOTSOCK` | `bad_file_descriptor` | 句柄已关闭 |
+| `ERROR_NETNAME_DELETED` | `connection_reset` | IOCP 原始的对端重置码 |
+| `ERROR_CONNECTION_REFUSED` | `connection_refused` | IOCP 原始的拒绝连接码 |
+
+**各情况的错误码**（两个平台、所有后端相同，均有测试）：
+
+| 情况 | 错误码 |
+|---|---|
+| 取消、关闭 socket、定时器 `cancel()`、resolver `cancel()` | `errc::operation_canceled` |
+| 在未打开的 socket 上发起操作 | `errc::bad_file_descriptor` |
+| 对已打开的 socket 再 `open()` / `assign()` | `errc::invalid_argument` |
+| TCP 对端正常关闭（读到 0 字节） | `error::eof`；UDP 没有 EOF，空数据报是成功、0 字节 |
+| 连接被拒绝 | `errc::connection_refused` |
+| 对端重置连接：读，或重置后第一次失败的写 | `errc::connection_reset` |
+| 本端 `shutdown(发送)` 后再写 | `errc::broken_pipe` |
+| 数据报比接收缓冲区大 | `error::datagram_truncated` |
+| 地址已被占用 | `errc::address_in_use` |
+| `tcp_server` 的限制与回调异常 | `error::message_too_large / send_queue_full / framing_error / handler_failed / idle_timeout / close_timeout`；本端 `close()` / `abort()` / `stop()` 时 `on_close` 收到空错误码 |
+| 域名解析 | `spanio.netdb` 的五个值；另有 `EAI_FAMILY / EAI_SOCKTYPE` → `address_family_not_supported`，`EAI_MEMORY` → `not_enough_memory`，`EAI_SYSTEM` → 当时的 `errno` |
+| `tcp::async_connect` 收到空地址列表 | `error::host_not_found` |
+
+**约定**（M3 评审确定）：
+- 重复打开用 `errc::invalid_argument`、空地址列表用 `host_not_found`，不另设 Asio 式的 `already_open` / `not_found`。
+- 收到任何错误后应关闭该连接。已报告过一次重置的连接上继续写，各平台报的码不同：Linux 报 `broken_pipe`（`EPIPE`），Windows 仍报 `connection_reset`。原因是 Linux 内核只报告一次重置错误；要区分“本端关闭了发送”与“重置已报告过”需要额外记录状态，收益不大，因此只在此说明。
+- 发送非空缓冲区却只发出 0 字节（正常不会发生，属防御代码）时，`async_write` 和 `tcp_server` 报 `errc::io_error`，避免死循环。
+- 只出现在日志里、不会交给回调的错误码（`strand` 的 `state_not_recoverable`、`io_context` 析构超时的 `timed_out`）不在统一范围内。
+
+测试：`tests/test_errors.cpp`，5 个用例（`connect_sequence_cancel`、`write_after_shutdown`、`write_after_peer_reset` 在每个后端上各跑一遍；`error_categories`；`normalize_platform_codes`）。
 
 ## 七、轻量易用设计
 
@@ -988,6 +1038,7 @@ spanio/
 │   ├── test_server_timeouts.cpp # 服务端超时与优雅关闭测试（已实现）
 │   ├── test_resolver.cpp       # 域名解析测试（已实现）
 │   ├── test_strand.cpp         # strand 与 bind_executor 测试（已实现）
+│   ├── test_errors.cpp         # 统一错误码测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -1081,7 +1132,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand 已完成；剩 API 冻结与文档收尾） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand、错误码统一已完成；剩 API 冻结与文档收尾） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 

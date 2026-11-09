@@ -24,15 +24,60 @@ namespace spanio { namespace detail {
 // Error codes
 // ----------------------------------------------------------------------------
 
+// Turn a system error into the form every SpanIO caller sees, so the same
+// situation compares equal to the same std::errc on every platform:
+// - cancellation (WSA_OPERATION_ABORTED / ECANCELED) -> operation_canceled
+// - Windows codes the C++ library does not map to any errc:
+//     WSAESHUTDOWN (write after a local shutdown)    -> broken_pipe, as EPIPE
+//     WSAENOTSOCK (handle already closed)            -> bad_file_descriptor
+//     ERROR_NETNAME_DELETED (raw IOCP peer reset)    -> connection_reset
+//     ERROR_CONNECTION_REFUSED (raw IOCP refusal)    -> connection_refused
+// Linux errno values already compare equal to std::errc and pass through.
+// Codes of other categories (spanio.misc, spanio.netdb, generic) are never
+// touched.
+// Parameter ec: error to translate
+// Return value: the translated error, or ec unchanged
+inline std::error_code normalize_error(const std::error_code& ec) noexcept
+{
+    if (!ec || ec.category() != std::system_category())
+    {
+        return ec;
+    }
+#if defined(SPANIO_PLATFORM_WINDOWS)
+    switch (ec.value())
+    {
+    // WSA_OPERATION_ABORTED and ERROR_OPERATION_ABORTED share one value
+    case WSA_OPERATION_ABORTED:
+        return std::make_error_code(std::errc::operation_canceled);
+    case WSAESHUTDOWN:
+        return std::make_error_code(std::errc::broken_pipe);
+    case WSAENOTSOCK:
+        return std::make_error_code(std::errc::bad_file_descriptor);
+    case ERROR_NETNAME_DELETED:
+        return std::make_error_code(std::errc::connection_reset);
+    case ERROR_CONNECTION_REFUSED:
+        return std::make_error_code(std::errc::connection_refused);
+    default:
+        return ec;
+    }
+#else
+    if (ec.value() == ECANCELED)
+    {
+        return std::make_error_code(std::errc::operation_canceled);
+    }
+    return ec;
+#endif
+}
+
 // Fetch the error left by the most recent failed socket call on this thread
 // Return value: the Winsock error on Windows or errno on Linux, wrapped in
-//               std::system_category so it compares against std::errc values
+//               std::system_category and passed through normalize_error()
 inline std::error_code last_error() noexcept
 {
 #if defined(SPANIO_PLATFORM_WINDOWS)
-    return std::error_code(::WSAGetLastError(), std::system_category());
+    return normalize_error(std::error_code(::WSAGetLastError(), std::system_category()));
 #else
-    return std::error_code(errno, std::system_category());
+    return normalize_error(std::error_code(errno, std::system_category()));
 #endif
 }
 

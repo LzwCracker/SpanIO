@@ -40,6 +40,7 @@
 #define SPANIO_DETAIL_IO_PROACTOR_H
 
 #include "spanio/detail/platform.h"
+#include "spanio/detail/socket_ops.h"
 
 #include <cstddef>
 #include <cstring>
@@ -248,24 +249,6 @@ inline void prepare_post(io_operation& op) noexcept
 inline bool is_read_side(op_kind kind) noexcept
 {
     return kind == op_kind::kAccept || kind == op_kind::kRecv || kind == op_kind::kRecvFrom;
-}
-
-// Map platform-specific "operation aborted" codes to errc::operation_canceled
-// so callers can test cancellation the same way on every backend
-// Parameter ec: raw error from the system
-// Return value: errc::operation_canceled for aborts, ec unchanged otherwise
-inline std::error_code normalize_error(const std::error_code& ec) noexcept
-{
-#if defined(SPANIO_PLATFORM_WINDOWS)
-    // WSA_OPERATION_ABORTED and ERROR_OPERATION_ABORTED share one value
-    if (ec.value() == WSA_OPERATION_ABORTED)
-#else
-    if (ec.value() == ECANCELED)
-#endif
-    {
-        return std::make_error_code(std::errc::operation_canceled);
-    }
-    return ec;
 }
 
 // Abstract completion backend. See the file header for the contract every

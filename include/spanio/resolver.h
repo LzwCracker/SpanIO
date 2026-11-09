@@ -638,6 +638,13 @@ public:
             m_handler(ec, m_endpoints[m_index]);
             return;
         }
+        if (ec == std::errc::operation_canceled)
+        {
+            // The user cancelled or closed the socket: stop here instead of
+            // reopening it for the next endpoint
+            m_handler(ec, tcp::endpoint());
+            return;
+        }
         m_last_error = ec;
         ++m_index;
         start();
@@ -668,6 +675,9 @@ namespace spanio { namespace tcp {
 // Parameter handler:   called as handler(std::error_code, const tcp::endpoint&
 //                      connected). On failure the error is that of the last
 //                      attempt, or error::host_not_found for an empty list.
+//                      Cancelling or closing the socket stops the sequence:
+//                      the handler gets errc::operation_canceled and no
+//                      further endpoint is tried.
 template <typename Handler>
 void async_connect(socket& sock, std::vector<endpoint> endpoints, Handler&& handler)
 {

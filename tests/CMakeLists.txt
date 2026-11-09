@@ -24,6 +24,7 @@ set(SPANIO_TEST_NAMES
     test_server_timeouts
     test_resolver
     test_strand
+    test_errors
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
