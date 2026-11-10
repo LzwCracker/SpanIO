@@ -26,6 +26,8 @@ set(SPANIO_TEST_NAMES
     test_strand
     test_errors
     test_api
+    test_client_examples
+    test_guide
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
@@ -39,3 +41,10 @@ foreach(test_name IN LISTS SPANIO_TEST_NAMES)
     set_target_properties(${test_name} PROPERTIES FOLDER "tests")
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# The code snippets of docs/guide.md must be the code test_guide compiles
+add_test(NAME guide_snippets_match
+    COMMAND ${CMAKE_COMMAND}
+        -DGUIDE=${CMAKE_CURRENT_SOURCE_DIR}/../docs/guide.md
+        -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/test_guide.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_guide_snippets.cmake)

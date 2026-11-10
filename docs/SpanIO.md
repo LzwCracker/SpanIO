@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.18（设计草案，按 M1 实现修订；库版本 0.3.0）
+> 版本：v0.19（设计草案，按 M1 实现修订；库版本 0.3.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.19 修订记录（2026-11-10）**：使用指南，M3 完成。
+> - 新增 docs/guide.md：面向使用者的中文指南，19 段代码与 	ests/test_guide.cpp 逐字相同，由 CTest 测试 guide_snippets_match（	ests/check_guide_snippets.cmake）保证。
+> - 新增示例 examples/tcp_client.cpp、examples/udp_client.cpp 及其测试 	ests/test_client_examples.cpp。
+> - 十 / 十二：同步工程结构；M3 标为完成。
 >
 > **v0.18 修订记录（2026-11-10）**：冻结 API，库版本 0.3.0。
 > - 新增 6.11：冻结范围、修改规则、同步接口的错误报告方式；新增 `include/spanio/spanio.h` 与 `include/spanio/version.h`。
@@ -1067,7 +1072,9 @@ spanio/
 │   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务（已实现）
 │   ├── timer_demo.cpp          # 定时器示例（已实现）
 │   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
-│   └── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
+│   ├── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
+│   ├── tcp_client.cpp          # TCP 客户端示例：异步解析、按地址列表连接、async_read、整体超时（已实现）
+│   └── udp_client.cpp          # UDP 客户端示例：同步解析、收发数据报、等待超时（已实现）
 ├── tests/
 │   ├── test_io_context.cpp
 │   ├── test_tcp.cpp            # TCP 接口测试（已实现）
@@ -1082,11 +1089,17 @@ spanio/
 │   ├── test_strand.cpp         # strand 与 bind_executor 测试（已实现）
 │   ├── test_errors.cpp         # 统一错误码测试（已实现）
 │   ├── test_api.cpp            # API 冻结守护测试与 async_read 测试（已实现）
+│   ├── test_client_examples.cpp # 两个客户端示例的测试（已实现）
+│   ├── test_guide.cpp          # 使用指南中每段代码的编译与运行（已实现）
+│   ├── check_guide_snippets.cmake # 比对指南代码块与 test_guide.cpp（CTest：guide_snippets_match）（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
 └── docs/
-│     └── design.md
+│     ├── SpanIO.md               # 设计文档（本文）
+│     ├── guide.md                # 使用指南（已实现）
+│     ├── code_rule.md            # 编码规范
+│     └── git_code_rule.md        # 提交规范
 └── spanio_demo.sln   
 ```
 
@@ -1175,7 +1188,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand、错误码统一、API 冻结（0.3.0）已完成；剩使用文档） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 
