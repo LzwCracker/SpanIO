@@ -59,6 +59,12 @@ class io_context;
 
 namespace spanio { namespace detail {
 
+class context_access;
+
+}}
+
+namespace spanio { namespace detail {
+
 // How long the destructor waits for started I/O operations to come back
 // before it gives up and leaks them (and the proactor they live in)
 constexpr int kContextDrainTimeoutMs = 5000;
@@ -268,7 +274,19 @@ public:
     // Return value: executor bound to this context
     executor_type get_executor() noexcept;
 
-    // ---- Internal interface for I/O objects (tcp::socket, acceptor, ...) ----
+    // Name of the proactor backend, for logs and tests
+    // Return value: static string, never null
+    const char* backend_name() const noexcept
+    {
+        return m_proactor->name();
+    }
+
+private:
+    friend class executor_work_guard;
+    friend class detail::context_access;
+
+    // ---- Internal interface for I/O objects, reached through
+    // ---- detail::context_access (tcp::socket, acceptor, steady_timer, ...) ----
 
     // Register a socket with the proactor before starting I/O on it
     // Parameter handle: open socket
@@ -361,15 +379,6 @@ public:
         return count;
     }
 
-    // Name of the proactor backend, for logs and tests
-    // Return value: static string, never null
-    const char* backend_name() const noexcept
-    {
-        return m_proactor->name();
-    }
-
-private:
-    friend class executor_work_guard;
 
     // Decrements the work count when a handler finishes, also when it throws
     class work_finished_on_exit
@@ -807,5 +816,72 @@ inline executor_work_guard make_work_guard(const io_context::executor_type& exec
 }
 
 }
+
+namespace spanio { namespace detail {
+
+// The only way into the internal interface of io_context. I/O objects
+// (tcp::socket, tcp::acceptor, udp::socket, steady_timer) and the tests of
+// the execution engine call it; it is not part of the public API, so it may
+// change without notice.
+class context_access
+{
+public:
+    // Register a socket with the proactor before starting I/O on it
+    // Parameter context: the context
+    // Parameter handle:  open socket
+    // Return value: empty on success, otherwise the proactor's error
+    static std::error_code register_handle(io_context& context, native_handle_t handle)
+    {
+        return context.register_handle(handle);
+    }
+
+    // Unregister a socket before closing it; pending operations complete as
+    // cancelled
+    // Parameter context: the context
+    // Parameter handle:  registered socket
+    // Return value: empty on success, otherwise the proactor's error
+    static std::error_code unregister_handle(io_context& context, native_handle_t handle)
+    {
+        return context.unregister_handle(handle);
+    }
+
+    // Cancel every pending operation on a socket
+    // Parameter context: the context
+    // Parameter handle:  registered socket
+    static void cancel_handle(io_context& context, native_handle_t handle)
+    {
+        context.cancel_handle(handle);
+    }
+
+    // Start an I/O operation made with make_io_op() and a prepare_*() helper
+    // Parameter context: the context; owns the operation from now on
+    // Parameter op:      operation to start
+    static void start_io(io_context& context, io_op_base* op)
+    {
+        context.start_io(op);
+    }
+
+    // Add a wait to a timer
+    // Parameter context:  the context; owns the wait from now on
+    // Parameter state:    the timer's state
+    // Parameter deadline: when the timer expires
+    // Parameter op:       wait made with make_wait_op()
+    static void schedule_timer(io_context& context, timer_state& state, timer_time_point deadline,
+                               timer_wait_op* op)
+    {
+        context.schedule_timer(state, deadline, op);
+    }
+
+    // Cancel the waits of a timer
+    // Parameter context: the context
+    // Parameter state:   the timer's state
+    // Return value: number of waits cancelled
+    static std::size_t cancel_timer(io_context& context, timer_state& state)
+    {
+        return context.cancel_timer(state);
+    }
+};
+
+}}
 
 #endif // SPANIO_IO_CONTEXT_H

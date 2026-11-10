@@ -17,19 +17,23 @@
 //
 //               Handler signatures:
 //               - async_connect:                    void(std::error_code)
-//               - async_read_some / async_write_some
+//               - async_read_some / async_read / async_write_some
 //                 / async_write:                    void(std::error_code, std::size_t)
 //               - async_accept:                     void(std::error_code, tcp::socket)
 //
+//               async_read and async_write are composed operations: they
+//               call the handler once the whole buffer is transferred.
+//
 //               Rules shared with the proactor (io_proactor.h):
-//               - At most one read (async_read_some / async_accept) and one
+//               - At most one read (async_read_some / async_read /
+//                 async_accept) and one
 //                 write (async_connect / async_write_some / async_write) may
 //                 be outstanding per socket. This is not checked.
 //               - Buffers must stay valid until the handler has run.
 //               - close(), cancel() and the destructor make pending
 //                 operations complete with errc::operation_canceled.
 //               - A read of a non-empty buffer that gets 0 bytes reports
-//                 spanio::error::eof.
+//                 spanio::error::misc_errors::eof.
 // Developer:    lzwcracker@gmail.com
 // Date:         2026-11-04
 // ============================================================================
@@ -60,29 +64,26 @@ namespace spanio { namespace tcp {
 // Default listen() backlog: the largest the system allows
 constexpr int kDefaultBacklog = SOMAXCONN;
 
-// Value that turns a boolean socket option on
-constexpr int kSocketOptionOn = 1;
-
 // An IP address and a port
 using endpoint = ip::endpoint;
 
 // Which direction socket::shutdown() closes
-enum shutdown_type
+enum class shutdown_type
 {
 #if defined(SPANIO_PLATFORM_WINDOWS)
     // Stop receiving: further reads fail
-    shutdown_receive = SD_RECEIVE,
+    receive = SD_RECEIVE,
     // Stop sending: the peer reads end of file after the pending data
-    shutdown_send = SD_SEND,
+    send = SD_SEND,
     // Both directions
-    shutdown_both = SD_BOTH
+    both = SD_BOTH
 #else
     // Stop receiving: further reads fail
-    shutdown_receive = SHUT_RD,
+    receive = SHUT_RD,
     // Stop sending: the peer reads end of file after the pending data
-    shutdown_send = SHUT_WR,
+    send = SHUT_WR,
     // Both directions
-    shutdown_both = SHUT_RDWR
+    both = SHUT_RDWR
 #endif
 };
 
@@ -147,7 +148,7 @@ public:
         const std::size_t rest_size = m_size - m_written;
         io_op_base* op = make_io_op(std::move(*this));
         prepare_send(*op, handle, rest, rest_size);
-        context.start_io(op);
+        context_access::start_io(context, op);
     }
 
     // Completion of one send: finish, or continue with the rest
@@ -186,6 +187,78 @@ private:
     Handler m_handler;
 };
 
+// Composed operation behind tcp::socket::async_read: keeps receiving until
+// the whole buffer is filled. Ends early on an error, or with
+// error::misc_errors::eof when the peer closes first; the handler then gets
+// the bytes received so far.
+template <typename Handler>
+class read_all_op
+{
+public:
+    // Parameter context: context the socket belongs to
+    // Parameter handle:  open, registered socket
+    // Parameter data:    destination; valid until the handler runs
+    // Parameter size:    number of bytes to read; greater than 0
+    // Parameter handler: function object taking (std::error_code, std::size_t)
+    template <typename H>
+    read_all_op(io_context& context, native_handle_t handle, char* data, std::size_t size, H&& handler)
+        : m_context(&context)
+        , m_handle(handle)
+        , m_data(data)
+        , m_size(size)
+        , m_read(0)
+        , m_handler(std::forward<H>(handler))
+    {
+    }
+
+    // Start a receive into the part not filled yet. This object is moved
+    // into the operation, so it must not be used afterwards.
+    void start()
+    {
+        io_context& context = *m_context;
+        const native_handle_t handle = m_handle;
+        char* rest = m_data + m_read;
+        const std::size_t rest_size = m_size - m_read;
+        io_op_base* op = make_io_op(std::move(*this));
+        prepare_recv(*op, handle, rest, rest_size);
+        context_access::start_io(context, op);
+    }
+
+    // Completion of one receive: finish, or continue with the rest
+    // Parameter result: the finished receive
+    void operator()(const io_result& result)
+    {
+        m_read += result.m_bytes;
+        std::error_code ec = result.m_ec;
+        if (!ec && result.m_bytes == 0)
+        {
+            // A receive of a non-empty buffer returns 0 bytes only when the
+            // peer closed: report it with the bytes that did arrive
+            ec = error::misc_errors::eof;
+        }
+        if (ec || m_read == m_size)
+        {
+            m_handler(ec, m_read);
+            return;
+        }
+        start();
+    }
+
+private:
+    // Context the receives run on
+    io_context* m_context;
+    // Socket being read
+    native_handle_t m_handle;
+    // Start of the whole buffer
+    char* m_data;
+    // Size of the whole buffer
+    std::size_t m_size;
+    // Bytes received so far
+    std::size_t m_read;
+    // User handler, called once at the end
+    Handler m_handler;
+};
+
 }}
 
 namespace spanio { namespace tcp {
@@ -195,6 +268,9 @@ namespace spanio { namespace tcp {
 class socket
 {
 public:
+    // Native socket handle type (SOCKET on Windows, int on Linux)
+    using native_handle_type = detail::native_handle_t;
+
     // Create a socket that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
     explicit socket(io_context& context) noexcept
@@ -260,7 +336,7 @@ public:
             detail::log_error("tcp::socket::open", ec);
             return ec;
         }
-        ec = m_context->register_handle(handle);
+        ec = detail::context_access::register_handle(*m_context, handle);
         if (ec)
         {
             detail::log_error("tcp::socket::open: register_handle", ec);
@@ -276,13 +352,13 @@ public:
     // Parameter handle: open TCP socket
     // Return value: empty on success; errc::invalid_argument if already
     //               open; otherwise the registration error
-    std::error_code assign(detail::native_handle_t handle)
+    std::error_code assign(native_handle_type handle)
     {
         if (is_open())
         {
             return detail::already_open_error();
         }
-        const std::error_code ec = m_context->register_handle(handle);
+        const std::error_code ec = detail::context_access::register_handle(*m_context, handle);
         if (ec)
         {
             detail::log_error("tcp::socket::assign: register_handle", ec);
@@ -301,7 +377,7 @@ public:
 
     // The native handle, for socket options not wrapped here
     // Return value: the handle, or kInvalidHandle when not open
-    detail::native_handle_t native_handle() const noexcept
+    native_handle_type native_handle() const noexcept
     {
         return m_handle;
     }
@@ -345,7 +421,7 @@ public:
     {
         if (is_open())
         {
-            m_context->cancel_handle(m_handle);
+            detail::context_access::cancel_handle(*m_context, m_handle);
         }
     }
 
@@ -357,7 +433,7 @@ public:
         {
             return;
         }
-        std::error_code ec = m_context->unregister_handle(m_handle);
+        std::error_code ec = detail::context_access::unregister_handle(*m_context, m_handle);
         if (ec)
         {
             detail::log_error("tcp::socket::close: unregister_handle", ec);
@@ -389,13 +465,13 @@ public:
         detail::io_op_base* op = detail::make_io_op(
             detail::connect_completion<handler_type>(std::forward<Handler>(handler)));
         detail::prepare_connect(*op, m_handle, peer.data(), peer.size());
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
     // Read whatever is available, at most buffer.size() bytes
     // Parameter buffer:  destination; valid until the handler runs
     // Parameter handler: called as handler(std::error_code, bytes read);
-    //                    spanio::error::eof when the peer closed
+    //                    spanio::error::misc_errors::eof when the peer closed
     template <typename Handler>
     void async_read_some(const mutable_buffer& buffer, Handler&& handler)
     {
@@ -408,7 +484,7 @@ public:
         detail::io_op_base* op = detail::make_io_op(
             detail::transfer_completion<handler_type>(std::forward<Handler>(handler), true));
         detail::prepare_recv(*op, m_handle, static_cast<char*>(buffer.data()), buffer.size());
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
     // Send part or all of a buffer (one send call)
@@ -426,7 +502,7 @@ public:
         detail::io_op_base* op = detail::make_io_op(
             detail::transfer_completion<handler_type>(std::forward<Handler>(handler), false));
         detail::prepare_send(*op, m_handle, static_cast<const char*>(buffer.data()), buffer.size());
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
     // Send the whole buffer, in as many sends as needed
@@ -445,6 +521,27 @@ public:
         detail::write_all_op<handler_type> op(*m_context, m_handle,
                                               static_cast<const char*>(buffer.data()),
                                               buffer.size(), std::forward<Handler>(handler));
+        op.start();
+    }
+
+    // Fill the whole buffer, in as many receives as needed
+    // Parameter buffer:  destination; valid until the handler runs
+    // Parameter handler: called once as handler(std::error_code, bytes read);
+    //                    bytes read equals buffer.size() on success. If the
+    //                    peer closes first the error is
+    //                    spanio::error::misc_errors::eof and bytes read is
+    //                    what arrived before
+    template <typename Handler>
+    void async_read(const mutable_buffer& buffer, Handler&& handler)
+    {
+        using handler_type = typename std::decay<Handler>::type;
+        if (!is_open() || buffer.size() == 0)
+        {
+            post_transfer(std::forward<Handler>(handler));
+            return;
+        }
+        detail::read_all_op<handler_type> op(*m_context, m_handle, static_cast<char*>(buffer.data()),
+                                             buffer.size(), std::forward<Handler>(handler));
         op.start();
     }
 
@@ -557,6 +654,9 @@ namespace spanio { namespace tcp {
 class acceptor
 {
 public:
+    // Native socket handle type (SOCKET on Windows, int on Linux)
+    using native_handle_type = detail::native_handle_t;
+
     // Create an acceptor that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
     explicit acceptor(io_context& context) noexcept
@@ -643,7 +743,7 @@ public:
 #else
         const int reuse_option = SO_REUSEADDR;
 #endif
-        const int on = kSocketOptionOn;
+        const int on = detail::kSocketOptionOn;
         if (::setsockopt(handle, SOL_SOCKET, reuse_option, reinterpret_cast<const char*>(&on),
                          static_cast<detail::socklen_type>(sizeof(on))) == detail::kSocketCallFailed)
         {
@@ -652,7 +752,7 @@ public:
             detail::close_socket(handle);
             return ec;
         }
-        ec = m_context->register_handle(handle);
+        ec = detail::context_access::register_handle(*m_context, handle);
         if (ec)
         {
             detail::log_error("tcp::acceptor::open: register_handle", ec);
@@ -709,7 +809,7 @@ public:
 
     // The native handle
     // Return value: the handle, or kInvalidHandle when not open
-    detail::native_handle_t native_handle() const noexcept
+    native_handle_type native_handle() const noexcept
     {
         return m_handle;
     }
@@ -727,7 +827,7 @@ public:
     {
         if (is_open())
         {
-            m_context->cancel_handle(m_handle);
+            detail::context_access::cancel_handle(*m_context, m_handle);
         }
     }
 
@@ -739,7 +839,7 @@ public:
         {
             return;
         }
-        std::error_code ec = m_context->unregister_handle(m_handle);
+        std::error_code ec = detail::context_access::unregister_handle(*m_context, m_handle);
         if (ec)
         {
             detail::log_error("tcp::acceptor::close: unregister_handle", ec);
@@ -769,7 +869,7 @@ public:
         detail::io_op_base* op = detail::make_io_op(
             detail::accept_completion<handler_type>(*m_context, std::forward<Handler>(handler)));
         detail::prepare_accept(*op, m_handle);
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
 private:

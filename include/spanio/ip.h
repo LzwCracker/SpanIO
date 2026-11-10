@@ -14,7 +14,7 @@
 //               }
 //
 //               Only numeric addresses are parsed; host names need the
-//               resolver (planned). The IPv6 scope id is kept but not shown
+//               resolver (resolver.h). The IPv6 scope id is kept but not shown
 //               by to_string().
 // Developer:    lzwcracker@gmail.com
 // Date:         2026-11-04
@@ -34,7 +34,7 @@
 #include <string>
 #include <system_error>
 
-namespace spanio { namespace ip {
+namespace spanio { namespace detail {
 
 // Bytes in an IPv4 address
 constexpr std::size_t kV4AddressBytes = 4;
@@ -48,6 +48,10 @@ constexpr std::size_t kAddressTextSize = INET6_ADDRSTRLEN;
 
 // inet_pton result that means the text was a valid address
 constexpr int kPtonSuccess = 1;
+
+}}
+
+namespace spanio { namespace ip {
 
 // An IPv4 or IPv6 address. Default-constructed it is the IPv4 wildcard
 // address 0.0.0.0. Addresses are stored in network byte order.
@@ -69,7 +73,7 @@ public:
     {
         address result;
         result.m_family = AF_INET;
-        std::memcpy(result.m_bytes.data(), &value, kV4AddressBytes);
+        std::memcpy(result.m_bytes.data(), &value, detail::kV4AddressBytes);
         return result;
     }
 
@@ -81,7 +85,7 @@ public:
     {
         address result;
         result.m_family = AF_INET6;
-        std::memcpy(result.m_bytes.data(), &value, kV6AddressBytes);
+        std::memcpy(result.m_bytes.data(), &value, detail::kV6AddressBytes);
         result.m_scope_id = scope_id;
         return result;
     }
@@ -112,7 +116,7 @@ public:
     in_addr to_v4() const noexcept
     {
         in_addr value{};
-        std::memcpy(&value, m_bytes.data(), kV4AddressBytes);
+        std::memcpy(&value, m_bytes.data(), detail::kV4AddressBytes);
         return value;
     }
 
@@ -121,7 +125,7 @@ public:
     in6_addr to_v6() const noexcept
     {
         in6_addr value{};
-        std::memcpy(&value, m_bytes.data(), kV6AddressBytes);
+        std::memcpy(&value, m_bytes.data(), detail::kV6AddressBytes);
         return value;
     }
 
@@ -136,7 +140,7 @@ public:
     // Return value: the text, or an empty string if formatting failed
     std::string to_string() const
     {
-        char text[kAddressTextSize] = {};
+        char text[detail::kAddressTextSize] = {};
         if (::inet_ntop(m_family, m_bytes.data(), text, sizeof(text)) == nullptr)
         {
             detail::log_error("inet_ntop", detail::last_error());
@@ -166,7 +170,7 @@ private:
     // AF_INET or AF_INET6
     int m_family;
     // Address bytes in network order; IPv4 uses the first 4, the rest stay 0
-    std::array<unsigned char, kV6AddressBytes> m_bytes;
+    std::array<unsigned char, detail::kV6AddressBytes> m_bytes;
     // IPv6 interface index; always 0 for IPv4
     std::uint32_t m_scope_id;
 };
@@ -184,12 +188,12 @@ inline address make_address(const char* text, std::error_code& ec)
         return address();
     }
     in_addr v4{};
-    if (::inet_pton(AF_INET, text, &v4) == kPtonSuccess)
+    if (::inet_pton(AF_INET, text, &v4) == detail::kPtonSuccess)
     {
         return address::from_v4(v4);
     }
     in6_addr v6{};
-    if (::inet_pton(AF_INET6, text, &v6) == kPtonSuccess)
+    if (::inet_pton(AF_INET6, text, &v6) == detail::kPtonSuccess)
     {
         return address::from_v6(v6);
     }
@@ -224,6 +228,10 @@ inline address make_address(const std::string& text)
 class endpoint
 {
 public:
+    // Length type of a native socket address (socklen_t on Linux, int on
+    // Windows), as used by from_native() and size()
+    using native_size_type = detail::socklen_type;
+
     // The IPv4 wildcard address with port 0
     endpoint() noexcept
         : endpoint(ip::address(), 0)
@@ -261,7 +269,7 @@ public:
     // Parameter data: sockaddr_in or sockaddr_in6
     // Parameter size: bytes valid at data
     // Return value: the endpoint
-    static endpoint from_native(const sockaddr* data, detail::socklen_type size) noexcept
+    static endpoint from_native(const sockaddr* data, native_size_type size) noexcept
     {
         endpoint result;
         std::size_t length = static_cast<std::size_t>(size);
@@ -321,7 +329,7 @@ public:
 
     // Number of meaningful bytes at data()
     // Return value: sizeof(sockaddr_in) or sizeof(sockaddr_in6)
-    detail::socklen_type size() const noexcept
+    native_size_type size() const noexcept
     {
         return m_size;
     }

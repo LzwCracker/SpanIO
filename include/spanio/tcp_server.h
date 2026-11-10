@@ -22,14 +22,14 @@
 //               - The string_view given to on_message is valid only during
 //                 the call.
 //               - An exception from on_connect or on_message closes that
-//                 connection with error::handler_failed; the server keeps
+//                 connection with error::misc_errors::handler_failed; the server keeps
 //                 running. An exception from on_close is only logged.
 //
 //               on_close reports why the connection ended: empty for a local
-//               close(), abort() or stop(); error::eof when the peer closed;
-//               error::message_too_large, error::send_queue_full,
-//               error::framing_error, error::handler_failed,
-//               error::idle_timeout or error::close_timeout when a limit
+//               close(), abort() or stop(); error::misc_errors::eof when the peer closed;
+//               error::misc_errors::message_too_large, error::misc_errors::send_queue_full,
+//               error::misc_errors::framing_error, error::misc_errors::handler_failed,
+//               error::misc_errors::idle_timeout or error::misc_errors::close_timeout when a limit
 //               or callback ended it; otherwise the system error.
 //
 //               Without a framer, on_message gets whatever each read
@@ -77,7 +77,7 @@
 #include <utility>
 #include <vector>
 
-namespace spanio {
+namespace spanio { namespace detail {
 
 // Default connection limit
 constexpr std::size_t kDefaultMaxConnections = 10000;
@@ -101,28 +101,32 @@ constexpr std::chrono::milliseconds kDefaultCloseTimeout(30000);
 // sent, before closing anyway (see tcp_connection::finish_flush_locked)
 constexpr std::chrono::milliseconds kLingerTimeout(2000);
 
+}}
+
+namespace spanio {
+
 // Limits of a tcp_server
 struct tcp_server_options
 {
     // Connections served at once; further ones are accepted and closed at
     // once, without on_connect. 0 means unlimited.
-    std::size_t m_max_connections = kDefaultMaxConnections;
+    std::size_t m_max_connections = detail::kDefaultMaxConnections;
     // Largest framed message, and the most input buffered while waiting for
     // one. Exceeding it closes the connection. Ignored without a framer.
-    std::size_t m_max_message_size = kDefaultMaxMessageSize;
+    std::size_t m_max_message_size = detail::kDefaultMaxMessageSize;
     // Most bytes queued for sending on one connection. Exceeding it closes
     // the connection, so a peer that stops reading cannot exhaust memory.
-    std::size_t m_max_send_queue_bytes = kDefaultMaxSendQueueBytes;
+    std::size_t m_max_send_queue_bytes = detail::kDefaultMaxSendQueueBytes;
     // Bytes read from a socket at a time; must not be 0
-    std::size_t m_read_buffer_size = kDefaultReadBufferSize;
+    std::size_t m_read_buffer_size = detail::kDefaultReadBufferSize;
     // Close a connection that had no activity for this long: no data
     // received and no send progress, so a client that only downloads is not
-    // idle. on_close gets error::idle_timeout. 0 turns it off.
-    std::chrono::milliseconds m_idle_timeout = kDefaultIdleTimeout;
+    // idle. on_close gets error::misc_errors::idle_timeout. 0 turns it off.
+    std::chrono::milliseconds m_idle_timeout = detail::kDefaultIdleTimeout;
     // Longest a close() may wait for queued data to go out; after that the
-    // connection is closed without it and on_close gets error::close_timeout.
+    // connection is closed without it and on_close gets error::misc_errors::close_timeout.
     // 0 waits for as long as it takes.
-    std::chrono::milliseconds m_close_timeout = kDefaultCloseTimeout;
+    std::chrono::milliseconds m_close_timeout = detail::kDefaultCloseTimeout;
 };
 
 class tcp_connection;
@@ -170,7 +174,7 @@ public:
     // Return value: true if queued (or empty); false if the connection is
     //               closing or closed, or the queue limit was exceeded, in
     //               which case the connection is closed with
-    //               error::send_queue_full
+    //               error::misc_errors::send_queue_full
     bool send(std::string_view data)
     {
         return enqueue(std::string(data));
@@ -193,8 +197,10 @@ public:
     }
 
     // Send everything already queued, then close. No further on_message is
-    // delivered, and send() returns false. Waits for as long as the peer
-    // does not read (see the file header).
+    // delivered, and send() returns false. Waits at most
+    // tcp_server_options::m_close_timeout for the queue to drain (0 waits
+    // without limit); after that the connection is closed without the rest
+    // and on_close gets error::misc_errors::close_timeout.
     void close();
 
     // Close now, dropping queued data
@@ -217,9 +223,9 @@ public:
 
     // Slot for user data about this connection, e.g. a session object
     // Return value: reference to the slot; empty until set
-    std::any& context() noexcept
+    std::any& user_data() noexcept
     {
-        return m_context;
+        return m_user_data;
     }
 
 private:
@@ -259,7 +265,7 @@ private:
     void on_read(std::error_code ec, std::size_t bytes);
 
     // End the read chain because of a read result
-    // Parameter ec: the error that ended it, e.g. error::eof
+    // Parameter ec: the error that ended it, e.g. error::misc_errors::eof
     void handle_read_end(const std::error_code& ec);
 
     // Pass received bytes to on_message, through the framer if there is one
@@ -297,7 +303,7 @@ private:
     // RST instead of FIN, and the peer could lose the data just sent. Caller
     // holds m_mutex.
     // Parameter limit: close limit in effect; the linger wait is the smaller
-    //                  of it and kLingerTimeout (0 means kLingerTimeout)
+    //                  of it and detail::kLingerTimeout (0 means detail::kLingerTimeout)
     void finish_flush_locked(std::chrono::milliseconds limit);
 
     // Close the socket and drop queued data. Caller holds m_mutex.
@@ -335,7 +341,7 @@ private:
     std::shared_ptr<detail::tcp_server_state> m_state;
     // Address of the peer, kept for use after the socket closed
     tcp::endpoint m_remote;
-    // Guards every field below except m_read_buffer, m_input and m_context,
+    // Guards every field below except m_read_buffer, m_input and m_user_data,
     // which only the read chain and the callbacks touch
     mutable std::mutex m_mutex;
     // The connection
@@ -376,7 +382,7 @@ private:
     // without m_mutex by the read and write paths
     std::atomic<steady_timer::clock::rep> m_last_activity;
     // User data; see context()
-    std::any m_context;
+    std::any m_user_data;
 };
 
 }
@@ -535,7 +541,7 @@ public:
         catch (...)
         {
             log_error("tcp_server: on_close threw an exception",
-                      make_error_code(error::handler_failed));
+                      make_error_code(error::misc_errors::handler_failed));
         }
     }
 
@@ -728,7 +734,7 @@ inline void tcp_connection::on_close_timer(const std::error_code& ec)
         return;
     }
     // Overrides the reason close() recorded: the data was not all sent
-    m_close_reason = make_error_code(error::close_timeout);
+    m_close_reason = make_error_code(error::misc_errors::close_timeout);
     m_has_reason = true;
     detail::log_error("tcp_server: close timed out", m_close_reason);
     close_socket_locked();
@@ -762,7 +768,7 @@ inline void tcp_connection::on_idle_timer(const std::error_code& ec)
     const steady_timer::time_point deadline = last + m_state->m_options.m_idle_timeout;
     if (steady_timer::clock::now() >= deadline)
     {
-        fail_locked(error::idle_timeout);
+        fail_locked(error::misc_errors::idle_timeout);
         return;
     }
     wait_for_idle_locked(deadline);
@@ -792,8 +798,8 @@ inline void tcp_connection::begin()
         catch (...)
         {
             detail::log_error("tcp_server: on_connect threw an exception",
-                              make_error_code(error::handler_failed));
-            fail(error::handler_failed);
+                              make_error_code(error::misc_errors::handler_failed));
+            fail(error::misc_errors::handler_failed);
         }
     }
     const std::chrono::milliseconds idle = m_state->m_options.m_idle_timeout;
@@ -822,7 +828,7 @@ inline bool tcp_connection::enqueue(std::string data)
     }
     if (m_queued_bytes + data.size() > m_state->m_options.m_max_send_queue_bytes)
     {
-        fail_locked(error::send_queue_full);
+        fail_locked(error::misc_errors::send_queue_full);
         return false;
     }
     m_queued_bytes += data.size();
@@ -876,7 +882,7 @@ inline void tcp_connection::handle_read_end(const std::error_code& ec)
             record_reason_locked(ec);
             // After eof the peer may still be reading (it only shut down its
             // sending side), so what is queued still goes out
-            if (ec == error::eof && m_writing)
+            if (ec == error::misc_errors::eof && m_writing)
             {
                 m_phase = phase::kClosing;
                 arm_close_timer_locked(m_state->m_options.m_close_timeout);
@@ -918,13 +924,13 @@ inline void tcp_connection::deliver(std::size_t bytes)
         catch (...)
         {
             detail::log_error("tcp_server: framer threw an exception",
-                              make_error_code(error::handler_failed));
-            fail(error::handler_failed);
+                              make_error_code(error::misc_errors::handler_failed));
+            fail(error::misc_errors::handler_failed);
             return;
         }
         if (frame.m_error || frame.m_consumed > rest.size())
         {
-            fail(error::framing_error);
+            fail(error::misc_errors::framing_error);
             return;
         }
         if (frame.m_consumed == 0)
@@ -933,7 +939,7 @@ inline void tcp_connection::deliver(std::size_t bytes)
         }
         if (frame.m_payload.size() > limit)
         {
-            fail(error::message_too_large);
+            fail(error::misc_errors::message_too_large);
             return;
         }
         offset += frame.m_consumed;
@@ -942,7 +948,7 @@ inline void tcp_connection::deliver(std::size_t bytes)
     m_input.erase(0, offset);
     if (m_input.size() > limit)
     {
-        fail(error::message_too_large);
+        fail(error::misc_errors::message_too_large);
     }
 }
 
@@ -959,8 +965,8 @@ inline void tcp_connection::deliver_one(std::string_view data)
     catch (...)
     {
         detail::log_error("tcp_server: on_message threw an exception",
-                          make_error_code(error::handler_failed));
-        fail(error::handler_failed);
+                          make_error_code(error::misc_errors::handler_failed));
+        fail(error::misc_errors::handler_failed);
     }
 }
 
@@ -1045,7 +1051,7 @@ inline void tcp_connection::record_reason_locked(const std::error_code& reason)
 
 inline void tcp_connection::finish_flush_locked(std::chrono::milliseconds limit)
 {
-    const std::error_code ec = m_socket.shutdown(tcp::shutdown_send);
+    const std::error_code ec = m_socket.shutdown(tcp::shutdown_type::send);
     if (ec)
     {
         detail::log_error("tcp_server: shutdown", ec);
@@ -1061,8 +1067,8 @@ inline void tcp_connection::finish_flush_locked(std::chrono::milliseconds limit)
     // file closes the socket (handle_read_end)
     m_phase = phase::kClosing;
     m_flushed = true;
-    const bool use_limit = limit.count() > 0 && limit < kLingerTimeout;
-    arm_close_timer_locked(use_limit ? limit : kLingerTimeout);
+    const bool use_limit = limit.count() > 0 && limit < detail::kLingerTimeout;
+    arm_close_timer_locked(use_limit ? limit : detail::kLingerTimeout);
 }
 
 inline void tcp_connection::close_socket_locked()
@@ -1220,7 +1226,7 @@ public:
     // Stop accepting at once, and close() every connection: no further
     // on_message, queued data is still sent. Connections not closed within
     // the grace period are closed without their data (on_close gets
-    // error::close_timeout). run() returns once all of them have closed.
+    // error::misc_errors::close_timeout). run() returns once all of them have closed.
     // Does not block; safe from any thread and from callbacks. A later
     // stop() ends the wait at once.
     // Parameter grace: longest wait; 0 waits for as long as it takes

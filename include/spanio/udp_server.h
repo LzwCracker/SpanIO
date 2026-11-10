@@ -69,13 +69,17 @@
 #include <utility>
 #include <vector>
 
+namespace spanio { namespace detail {
+
+// Default limit for output queued on a udp_server: 16 MiB
+constexpr std::size_t kDefaultUdpSendQueueBytes = 16 * 1024 * 1024;
+
+}}
+
 namespace spanio {
 
 // Largest UDP payload over IPv4: 65535 minus the IP and UDP headers
 constexpr std::size_t kMaxUdpPayload = 65507;
-
-// Default limit for output queued on a udp_server: 16 MiB
-constexpr std::size_t kDefaultUdpSendQueueBytes = 16 * 1024 * 1024;
 
 // Limits of a udp_server
 struct udp_server_options
@@ -84,7 +88,7 @@ struct udp_server_options
     // dropped and counted in udp_server_stats::m_truncated.
     std::size_t m_max_datagram_size = kMaxUdpPayload;
     // Most bytes queued for sending; send_to() refuses more
-    std::size_t m_max_send_queue_bytes = kDefaultUdpSendQueueBytes;
+    std::size_t m_max_send_queue_bytes = detail::kDefaultUdpSendQueueBytes;
 };
 
 // What a udp_server has done so far
@@ -315,7 +319,7 @@ private:
                 return;
             }
         }
-        if (ec == error::datagram_truncated)
+        if (ec == error::misc_errors::datagram_truncated)
         {
             ++m_truncated;
         }
@@ -347,7 +351,7 @@ private:
         }
         catch (...)
         {
-            log_error("udp_server: on_datagram threw an exception", make_error_code(error::handler_failed));
+            log_error("udp_server: on_datagram threw an exception", make_error_code(error::misc_errors::handler_failed));
         }
     }
 
@@ -408,7 +412,7 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_closed)
         {
-            log_error("udp_server: graceful stop timed out", make_error_code(error::close_timeout));
+            log_error("udp_server: graceful stop timed out", make_error_code(error::misc_errors::close_timeout));
             close_now_locked();
         }
     }

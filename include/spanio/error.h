@@ -9,7 +9,7 @@
 //                 failures reported by resolver.h
 // Usage:        sock.async_read_some(buf, handler);
 //               ...
-//               if (ec == spanio::error::eof)
+//               if (ec == spanio::error::misc_errors::eof)
 //               {
 //                   // the peer closed the connection in an orderly way
 //               }
@@ -28,7 +28,7 @@ namespace spanio { namespace error {
 
 // Errors reported by SpanIO itself rather than by the operating system.
 // Values start at 1 because 0 means "no error" in std::error_code.
-enum misc_errors
+enum class misc_errors
 {
     // The peer closed the connection in an orderly way: a read completed
     // with 0 bytes although the buffer was not empty
@@ -73,21 +73,21 @@ public:
     {
         switch (value)
         {
-        case eof:
+        case static_cast<int>(misc_errors::eof):
             return "End of file";
-        case message_too_large:
+        case static_cast<int>(misc_errors::message_too_large):
             return "Message too large";
-        case send_queue_full:
+        case static_cast<int>(misc_errors::send_queue_full):
             return "Send queue full";
-        case framing_error:
+        case static_cast<int>(misc_errors::framing_error):
             return "Malformed message framing";
-        case datagram_truncated:
+        case static_cast<int>(misc_errors::datagram_truncated):
             return "Datagram truncated";
-        case idle_timeout:
+        case static_cast<int>(misc_errors::idle_timeout):
             return "Connection idle for too long";
-        case close_timeout:
+        case static_cast<int>(misc_errors::close_timeout):
             return "Close timed out before all data was sent";
-        case handler_failed:
+        case static_cast<int>(misc_errors::handler_failed):
             return "User callback failed";
         default:
             return "spanio.misc error";
@@ -104,7 +104,7 @@ inline const std::error_category& misc_category() noexcept
 }
 
 // Make an error_code from a misc_errors value; found by argument-dependent
-// lookup, so `std::error_code ec = spanio::error::eof;` works
+// lookup, so `std::error_code ec = spanio::error::misc_errors::eof;` works
 // Parameter value: the error
 // Return value: the error code in the misc category
 inline std::error_code make_error_code(misc_errors value) noexcept
@@ -114,7 +114,7 @@ inline std::error_code make_error_code(misc_errors value) noexcept
 
 // Name resolution errors (resolver.h), the same on every platform. The
 // getaddrinfo() codes of each system are mapped onto these.
-enum netdb_errors
+enum class netdb_errors
 {
     // The host name is not known
     host_not_found = 1,
@@ -147,15 +147,15 @@ public:
     {
         switch (value)
         {
-        case host_not_found:
+        case static_cast<int>(netdb_errors::host_not_found):
             return "Host not found";
-        case host_not_found_try_again:
+        case static_cast<int>(netdb_errors::host_not_found_try_again):
             return "Host not found, try again later";
-        case no_data:
+        case static_cast<int>(netdb_errors::no_data):
             return "Host has no address of the requested type";
-        case no_recovery:
+        case static_cast<int>(netdb_errors::no_recovery):
             return "Non-recoverable name resolution failure";
-        case service_not_found:
+        case static_cast<int>(netdb_errors::service_not_found):
             return "Service not found";
         default:
             return "spanio.netdb error";

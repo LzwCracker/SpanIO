@@ -396,9 +396,9 @@ private:
     {
         overlap_scope scope(m_detector);
         note_io_handler();
-        if (ec == spanio::error::eof)
+        if (ec == spanio::error::misc_errors::eof)
         {
-            m_server.shutdown(tcp::shutdown_send);
+            m_server.shutdown(tcp::shutdown_type::send);
             return;
         }
         if (ec)
@@ -430,7 +430,7 @@ private:
     {
         if (m_write_offset == kEchoBytes)
         {
-            m_client.shutdown(tcp::shutdown_send);
+            m_client.shutdown(tcp::shutdown_type::send);
             return;
         }
         const std::size_t size = std::min(kEchoChunk, kEchoBytes - m_write_offset);
@@ -467,7 +467,7 @@ private:
     {
         overlap_scope scope(m_detector);
         note_io_handler();
-        if (ec == spanio::error::eof)
+        if (ec == spanio::error::misc_errors::eof)
         {
             m_client_eof = true;
             return;

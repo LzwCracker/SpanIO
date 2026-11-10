@@ -605,7 +605,7 @@ SPANIO_TEST(idle_timeout_closes_silent_connection)
         SPANIO_REQUIRE(slot.wait() != nullptr);
         slot.reset();
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::idle_timeout);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::idle_timeout);
         SPANIO_CHECK(closes.time(0) - slot.connected_at() >= kIdleTimeout);
         SPANIO_CHECK(fixture.server().connection_count() == 0);
     }
@@ -641,7 +641,7 @@ SPANIO_TEST(received_data_keeps_connection_alive)
         SPANIO_CHECK(closes.count() == 0);
 
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::idle_timeout);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::idle_timeout);
         SPANIO_CHECK(closes.time(0) - last_send >= kIdleTimeout);
     }
 }
@@ -700,7 +700,7 @@ SPANIO_TEST(sending_counts_as_activity)
         SPANIO_CHECK(closes.wait_for(1));
         reading = false;
         reader.join();
-        SPANIO_CHECK(closes.reason(0) == spanio::error::idle_timeout);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::idle_timeout);
     }
 }
 
@@ -757,7 +757,7 @@ SPANIO_TEST(close_timeout_aborts_stalled_flush)
         socket_guard silent;
         SPANIO_REQUIRE(connect_client(fixture.port(), silent));
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::close_timeout);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::close_timeout);
         std::lock_guard<std::mutex> lock(closed_at_mutex);
         SPANIO_CHECK(closes.time(0) - closed_at >= kShortLimit);
     }
@@ -902,7 +902,7 @@ SPANIO_TEST(graceful_stop_aborts_after_grace)
         SPANIO_CHECK(elapsed(start) >= kShortLimit);
         SPANIO_CHECK(elapsed(start) < kGenerousLimit);
         SPANIO_REQUIRE(closes.count() == 1);
-        SPANIO_CHECK(closes.reason(0) == spanio::error::close_timeout);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::close_timeout);
     }
 }
 
@@ -1044,7 +1044,7 @@ SPANIO_TEST(multi_thread_idle_timeouts)
         SPANIO_CHECK(closes.count() == static_cast<std::size_t>(kIdleClients));
         for (std::size_t i = 0; i < closes.count(); ++i)
         {
-            SPANIO_CHECK(closes.reason(i) == spanio::error::idle_timeout);
+            SPANIO_CHECK(closes.reason(i) == spanio::error::misc_errors::idle_timeout);
         }
         SPANIO_CHECK(fixture.server().connection_count() == 0);
     }

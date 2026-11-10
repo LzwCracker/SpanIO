@@ -510,7 +510,7 @@ SPANIO_TEST(io_completion_invokes_handler)
         socket_guard server;
         make_tcp_pair(client, server);
         std::unique_ptr<io_context> ctx = make_context(backend);
-        SPANIO_REQUIRE(!ctx->register_handle(server.get()));
+        SPANIO_REQUIRE(!spanio::detail::context_access::register_handle(*ctx, server.get()));
 
         char buffer[kBufferSize] = {};
         io_result result{};
@@ -529,7 +529,7 @@ SPANIO_TEST(io_completion_invokes_handler)
         };
         spanio::detail::io_op_base* op = make_io_op(record_result);
         prepare_recv(*op, server.get(), buffer, sizeof(buffer));
-        ctx->start_io(op);
+        spanio::detail::context_access::start_io(*ctx, op);
 
         std::thread peer(delayed_send);
         const test_clock::time_point start = test_clock::now();
@@ -545,7 +545,7 @@ SPANIO_TEST(io_completion_invokes_handler)
         SPANIO_CHECK(std::memcmp(buffer, kMessage, kMessageLength) == 0);
         SPANIO_CHECK(waited >= kMinWakeMs);
         SPANIO_CHECK(ctx->stopped());
-        SPANIO_CHECK(!ctx->unregister_handle(server.get()));
+        SPANIO_CHECK(!spanio::detail::context_access::unregister_handle(*ctx, server.get()));
         check_fast_destruction(ctx);
     }
 }
@@ -561,7 +561,7 @@ SPANIO_TEST(cancel_pending_io_reports_canceled)
         socket_guard server;
         make_tcp_pair(client, server);
         std::unique_ptr<io_context> ctx = make_context(backend);
-        SPANIO_REQUIRE(!ctx->register_handle(server.get()));
+        SPANIO_REQUIRE(!spanio::detail::context_access::register_handle(*ctx, server.get()));
 
         char buffer[kBufferSize] = {};
         io_result result{};
@@ -575,11 +575,11 @@ SPANIO_TEST(cancel_pending_io_reports_canceled)
         };
         auto cancel_recv = [&context, handle]()
         {
-            context.cancel_handle(handle);
+            spanio::detail::context_access::cancel_handle(context, handle);
         };
         spanio::detail::io_op_base* op = make_io_op(record_result);
         prepare_recv(*op, server.get(), buffer, sizeof(buffer));
-        ctx->start_io(op);
+        spanio::detail::context_access::start_io(*ctx, op);
         ctx->post(cancel_recv);
 
         const test_clock::time_point start = test_clock::now();
@@ -588,7 +588,7 @@ SPANIO_TEST(cancel_pending_io_reports_canceled)
         SPANIO_CHECK(calls == 1);
         SPANIO_CHECK(result.m_ec == std::make_error_code(std::errc::operation_canceled));
         SPANIO_CHECK(result.m_bytes == 0);
-        SPANIO_CHECK(!ctx->unregister_handle(server.get()));
+        SPANIO_CHECK(!spanio::detail::context_access::unregister_handle(*ctx, server.get()));
         check_fast_destruction(ctx);
     }
 }
@@ -608,7 +608,7 @@ SPANIO_TEST(destructor_drains_canceled_io)
         char buffer[kBufferSize] = {};
         {
             std::unique_ptr<io_context> ctx = make_context(backend);
-            SPANIO_REQUIRE(!ctx->register_handle(server.get()));
+            SPANIO_REQUIRE(!spanio::detail::context_access::register_handle(*ctx, server.get()));
             auto mark_called = [token, &called](const io_result&)
             {
                 called = true;
@@ -616,11 +616,11 @@ SPANIO_TEST(destructor_drains_canceled_io)
             // Moved, so only the operation keeps a reference to token
             spanio::detail::io_op_base* op = make_io_op(std::move(mark_called));
             prepare_recv(*op, server.get(), buffer, sizeof(buffer));
-            ctx->start_io(op);
+            spanio::detail::context_access::start_io(*ctx, op);
             SPANIO_CHECK(token.use_count() == kSoleOwner + 1);
             // Unregistering is what a socket does before it closes; the recv
             // completes as cancelled but nobody runs the context
-            SPANIO_CHECK(!ctx->unregister_handle(server.get()));
+            SPANIO_CHECK(!spanio::detail::context_access::unregister_handle(*ctx, server.get()));
             check_fast_destruction(ctx);
         }
         SPANIO_CHECK(token.use_count() == kSoleOwner);

@@ -286,8 +286,8 @@ inline std::error_code set_nonblocking(native_handle_t handle, bool enable) noex
 #endif
 #endif
 
-// Value that turns a boolean option on in configure_datagram_socket
-constexpr int kDatagramOptionOn = 1;
+// Value that turns a boolean socket option on (setsockopt)
+constexpr int kSocketOptionOn = 1;
 
 // Give a new datagram socket the same behaviour on every platform.
 // On Windows:
@@ -302,7 +302,7 @@ constexpr int kDatagramOptionOn = 1;
 inline std::error_code configure_datagram_socket(native_handle_t handle) noexcept
 {
 #if defined(SPANIO_PLATFORM_WINDOWS)
-    const int exclusive = kDatagramOptionOn;
+    const int exclusive = kSocketOptionOn;
     if (::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
                      static_cast<socklen_type>(sizeof(exclusive))) == kSocketCallFailed)
     {

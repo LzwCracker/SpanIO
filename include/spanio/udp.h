@@ -26,7 +26,7 @@
 //               - An empty datagram is valid: it arrives as success with 0
 //                 bytes. UDP has no end of file.
 //               - A datagram larger than the receive buffer reports
-//                 error::datagram_truncated; the part that fit is in the
+//                 error::misc_errors::datagram_truncated; the part that fit is in the
 //                 buffer and the rest is lost.
 //               - A datagram too large for the protocol fails its send with
 //                 errc::message_size.
@@ -116,7 +116,7 @@ public:
         const bool truncated = ec == std::errc::message_size;
         if (truncated)
         {
-            ec = error::datagram_truncated;
+            ec = error::misc_errors::datagram_truncated;
         }
         udp::endpoint sender;
         if (!result.m_ec || truncated)
@@ -141,6 +141,9 @@ namespace spanio { namespace udp {
 class socket
 {
 public:
+    // Native socket handle type (SOCKET on Windows, int on Linux)
+    using native_handle_type = detail::native_handle_t;
+
     // Create a socket that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
     explicit socket(io_context& context) noexcept
@@ -228,7 +231,7 @@ public:
         ec = detail::configure_datagram_socket(handle);
         if (!ec)
         {
-            ec = m_context->register_handle(handle);
+            ec = detail::context_access::register_handle(*m_context, handle);
         }
         if (ec)
         {
@@ -268,7 +271,7 @@ public:
 
     // The native handle, for socket options not wrapped here
     // Return value: the handle, or kInvalidHandle when not open
-    detail::native_handle_t native_handle() const noexcept
+    native_handle_type native_handle() const noexcept
     {
         return m_handle;
     }
@@ -286,7 +289,7 @@ public:
     {
         if (is_open())
         {
-            m_context->cancel_handle(m_handle);
+            detail::context_access::cancel_handle(*m_context, m_handle);
         }
     }
 
@@ -298,7 +301,7 @@ public:
         {
             return;
         }
-        std::error_code ec = m_context->unregister_handle(m_handle);
+        std::error_code ec = detail::context_access::unregister_handle(*m_context, m_handle);
         if (ec)
         {
             detail::log_error("udp::socket::close: unregister_handle", ec);
@@ -330,7 +333,7 @@ public:
         detail::io_op_base* op = detail::make_io_op(
             detail::receive_from_completion<handler_type>(std::forward<Handler>(handler)));
         detail::prepare_receive_from(*op, m_handle, static_cast<char*>(buffer.data()), buffer.size());
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
     // Send one datagram, opening the socket first if needed
@@ -355,7 +358,7 @@ public:
             detail::transfer_completion<handler_type>(std::forward<Handler>(handler), false));
         detail::prepare_send_to(*op, m_handle, static_cast<const char*>(buffer.data()), buffer.size(),
                                 peer.data(), peer.size());
-        m_context->start_io(op);
+        detail::context_access::start_io(*m_context, op);
     }
 
 private:

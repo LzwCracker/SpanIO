@@ -297,7 +297,7 @@ SPANIO_TEST(resolve_service_name)
     tcp::resolver resolver(ctx);
     std::error_code ec;
     const std::vector<tcp::endpoint> found = resolver.resolve("127.0.0.1", "http", ec);
-    if (ec == spanio::error::service_not_found)
+    if (ec == spanio::error::netdb_errors::service_not_found)
     {
         std::printf("    skipped: no services entry for \"http\"\n");
         return;
@@ -314,7 +314,7 @@ SPANIO_TEST(unknown_service)
     tcp::resolver resolver(ctx);
     std::error_code ec;
     const std::vector<tcp::endpoint> found = resolver.resolve("127.0.0.1", "no-such-service-spanio", ec);
-    SPANIO_CHECK(ec == spanio::error::service_not_found);
+    SPANIO_CHECK(ec == spanio::error::netdb_errors::service_not_found);
     SPANIO_CHECK(found.empty());
 }
 
@@ -327,7 +327,7 @@ SPANIO_TEST(numeric_host_rejects_names)
     options.m_numeric_host = true;
     std::error_code ec;
     const std::vector<tcp::endpoint> found = resolver.resolve("localhost", "8080", ec, options);
-    SPANIO_CHECK(ec == spanio::error::host_not_found);
+    SPANIO_CHECK(ec == spanio::error::netdb_errors::host_not_found);
     SPANIO_CHECK(found.empty());
 
     const std::vector<tcp::endpoint> numeric = resolver.resolve("127.0.0.1", "8080", ec, options);
@@ -345,8 +345,8 @@ SPANIO_TEST(unknown_host)
     resolver.async_resolve("nonexistent.invalid", "80", record_resolve(async));
     ctx.run();
     SPANIO_CHECK(async.m_calls == 1);
-    SPANIO_CHECK(async.m_ec == spanio::error::host_not_found
-                 || async.m_ec == spanio::error::host_not_found_try_again);
+    SPANIO_CHECK(async.m_ec == spanio::error::netdb_errors::host_not_found
+                 || async.m_ec == spanio::error::netdb_errors::host_not_found_try_again);
     SPANIO_CHECK(async.m_endpoints.empty());
     SPANIO_CHECK(std::string(async.m_ec.category().name()) == "spanio.netdb");
 }
@@ -566,7 +566,7 @@ SPANIO_TEST(async_connect_all_fail)
         SPANIO_CHECK(empty_calls == 0);
         ctx->run();
         SPANIO_CHECK(empty_calls == 1);
-        SPANIO_CHECK(empty_ec == spanio::error::host_not_found);
+        SPANIO_CHECK(empty_ec == spanio::error::netdb_errors::host_not_found);
     }
 }
 

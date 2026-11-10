@@ -271,7 +271,7 @@ private:
         {
             if (std::uncaught_exceptions() > 0)
             {
-                log_error("strand: handler", make_error_code(error::handler_failed));
+                log_error("strand: handler", make_error_code(error::misc_errors::handler_failed));
             }
             finish(m_impl, m_inner);
         }

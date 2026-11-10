@@ -355,7 +355,7 @@ private:
     {
         if (ec)
         {
-            if (ec != spanio::error::eof)
+            if (ec != spanio::error::misc_errors::eof)
             {
                 ++m_stats->m_errors;
             }
@@ -523,7 +523,7 @@ private:
             send_round();
             return;
         }
-        if (m_socket.shutdown(tcp::shutdown_send))
+        if (m_socket.shutdown(tcp::shutdown_type::send))
         {
             ++m_stats->m_errors;
             return;
@@ -537,7 +537,7 @@ private:
         std::shared_ptr<echo_client> self = shared_from_this();
         auto on_eof = [self](std::error_code ec, std::size_t)
         {
-            if (ec == spanio::error::eof)
+            if (ec == spanio::error::misc_errors::eof)
             {
                 ++self->m_stats->m_finished;
             }
@@ -770,16 +770,16 @@ SPANIO_TEST(buffer_helpers)
     SPANIO_CHECK(empty.size() == 0);
 }
 
-// Case 4: spanio::error::eof is a proper error_code in its own category
+// Case 4: spanio::error::misc_errors::eof is a proper error_code in its own category
 SPANIO_TEST(error_eof_category)
 {
-    const std::error_code ec = spanio::error::eof;
+    const std::error_code ec = spanio::error::misc_errors::eof;
     SPANIO_CHECK(static_cast<bool>(ec));
     SPANIO_CHECK(std::strcmp(ec.category().name(), "spanio.misc") == 0);
     SPANIO_CHECK(&ec.category() == &spanio::error::misc_category());
     SPANIO_CHECK(!ec.message().empty());
-    SPANIO_CHECK(ec == spanio::error::make_error_code(spanio::error::eof));
-    SPANIO_CHECK(ec == spanio::error::eof);
+    SPANIO_CHECK(ec == spanio::error::make_error_code(spanio::error::misc_errors::eof));
+    SPANIO_CHECK(ec == spanio::error::misc_errors::eof);
     SPANIO_CHECK(ec != std::make_error_code(std::errc::operation_canceled));
 }
 
@@ -920,7 +920,7 @@ SPANIO_TEST(async_write_large_buffer)
 }
 
 // Case 9: after the peer shuts down sending, a read reports
-// spanio::error::eof with 0 bytes
+// spanio::error::misc_errors::eof with 0 bytes
 SPANIO_TEST(read_eof_after_peer_shutdown)
 {
     for (const backend_factory& backend : backends())
@@ -932,13 +932,13 @@ SPANIO_TEST(read_eof_after_peer_shutdown)
         tcp::socket server(*ctx);
         connect_pair(*ctx, acc, client, server);
 
-        SPANIO_CHECK(!client.shutdown(tcp::shutdown_send));
+        SPANIO_CHECK(!client.shutdown(tcp::shutdown_type::send));
         char buffer[kSmallBufferSize] = {};
         transfer_record read;
         server.async_read_some(spanio::buffer(buffer), record_transfer(read));
         SPANIO_CHECK(ctx->run() == 1);
         SPANIO_CHECK(read.m_calls == 1);
-        SPANIO_CHECK(read.m_ec == spanio::error::eof);
+        SPANIO_CHECK(read.m_ec == spanio::error::misc_errors::eof);
         SPANIO_CHECK(read.m_bytes == 0);
     }
 }
@@ -1197,7 +1197,7 @@ SPANIO_TEST(async_write_continues_after_partial_send)
         auto on_written = [&](std::error_code write_ec, std::size_t bytes)
         {
             record_written(write_ec, bytes);
-            client.shutdown(tcp::shutdown_send);
+            client.shutdown(tcp::shutdown_type::send);
         };
         reader.start();
         client.async_write(spanio::buffer(payload), on_written);

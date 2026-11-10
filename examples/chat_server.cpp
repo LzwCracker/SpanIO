@@ -386,7 +386,7 @@ private:
     // Parameter connection: the new connection
     static void on_connect(const spanio::tcp_connection_ptr& connection)
     {
-        connection->context() = std::string();
+        connection->user_data() = std::string();
     }
 
     // Handle one line: the nickname, or else a message
@@ -395,7 +395,7 @@ private:
     // Parameter line:       the line, without its line end
     static void on_line(chat_room& room, const spanio::tcp_connection_ptr& connection, std::string_view line)
     {
-        std::string& nickname = std::any_cast<std::string&>(connection->context());
+        std::string& nickname = std::any_cast<std::string&>(connection->user_data());
         if (!nickname.empty())
         {
             if (!line.empty())
@@ -420,7 +420,7 @@ private:
     // Parameter connection: the connection
     static void on_closed(chat_room& room, const spanio::tcp_connection_ptr& connection)
     {
-        const std::string& nickname = std::any_cast<const std::string&>(connection->context());
+        const std::string& nickname = std::any_cast<const std::string&>(connection->user_data());
         if (!nickname.empty())
         {
             room.leave(nickname);

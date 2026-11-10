@@ -123,7 +123,7 @@ private:
 };
 
 // Completion of a single recv or send: passes the error and byte count.
-// For reads, 0 bytes without an error becomes spanio::error::eof.
+// For reads, 0 bytes without an error becomes spanio::error::misc_errors::eof.
 template <typename Handler>
 class transfer_completion
 {
@@ -143,7 +143,7 @@ public:
         std::error_code ec = result.m_ec;
         if (!ec && m_is_read && result.m_bytes == 0)
         {
-            ec = error::eof;
+            ec = error::misc_errors::eof;
         }
         m_handler(ec, result.m_bytes);
     }

@@ -121,30 +121,30 @@ inline std::error_code getaddrinfo_error(int result) noexcept
 {
     if (result == EAI_NONAME)
     {
-        return make_error_code(error::host_not_found);
+        return make_error_code(error::netdb_errors::host_not_found);
     }
     if (result == EAI_AGAIN)
     {
-        return make_error_code(error::host_not_found_try_again);
+        return make_error_code(error::netdb_errors::host_not_found_try_again);
     }
     if (result == EAI_FAIL)
     {
-        return make_error_code(error::no_recovery);
+        return make_error_code(error::netdb_errors::no_recovery);
     }
     if (result == EAI_SERVICE)
     {
-        return make_error_code(error::service_not_found);
+        return make_error_code(error::netdb_errors::service_not_found);
     }
 #if defined(EAI_NODATA)
     if (result == EAI_NODATA)
     {
-        return make_error_code(error::no_data);
+        return make_error_code(error::netdb_errors::no_data);
     }
 #endif
 #if defined(EAI_ADDRFAMILY)
     if (result == EAI_ADDRFAMILY)
     {
-        return make_error_code(error::no_data);
+        return make_error_code(error::netdb_errors::no_data);
     }
 #endif
     if (result == EAI_FAMILY || result == EAI_SOCKTYPE)
@@ -161,7 +161,7 @@ inline std::error_code getaddrinfo_error(int result) noexcept
         return std::error_code(errno, std::system_category());
     }
 #endif
-    return make_error_code(error::no_recovery);
+    return make_error_code(error::netdb_errors::no_recovery);
 }
 
 // Resolve with the system's getaddrinfo(); the default resolve_function
@@ -224,7 +224,7 @@ inline std::vector<ip::endpoint> system_resolve(const std::string& host, const s
     ::freeaddrinfo(list);
     if (endpoints.empty())
     {
-        ec = make_error_code(error::no_data);
+        ec = make_error_code(error::netdb_errors::no_data);
     }
     return endpoints;
 }
@@ -617,7 +617,7 @@ public:
     {
         if (m_index >= m_endpoints.size())
         {
-            const std::error_code ec = m_last_error ? m_last_error : make_error_code(error::host_not_found);
+            const std::error_code ec = m_last_error ? m_last_error : make_error_code(error::netdb_errors::host_not_found);
             m_socket->context().post(connect_result_binder<Handler>(std::move(m_handler), ec));
             return;
         }
@@ -674,7 +674,7 @@ namespace spanio { namespace tcp {
 // Parameter endpoints: candidates in order, e.g. a resolver's result
 // Parameter handler:   called as handler(std::error_code, const tcp::endpoint&
 //                      connected). On failure the error is that of the last
-//                      attempt, or error::host_not_found for an empty list.
+//                      attempt, or error::netdb_errors::host_not_found for an empty list.
 //                      Cancelling or closing the socket stops the sequence:
 //                      the handler gets errc::operation_canceled and no
 //                      further endpoint is tried.

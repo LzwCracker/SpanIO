@@ -127,7 +127,7 @@ public:
     template <typename Handler>
     void async_wait(Handler&& handler)
     {
-        m_context->schedule_timer(m_state, m_expiry, detail::make_wait_op(std::forward<Handler>(handler)));
+        detail::context_access::schedule_timer(*m_context, m_state, m_expiry, detail::make_wait_op(std::forward<Handler>(handler)));
     }
 
     // Cancel pending waits; their handlers get errc::operation_canceled
@@ -135,7 +135,7 @@ public:
     //               includes waits whose timer already expired
     std::size_t cancel()
     {
-        return m_context->cancel_timer(m_state);
+        return detail::context_access::cancel_timer(*m_context, m_state);
     }
 
 private:

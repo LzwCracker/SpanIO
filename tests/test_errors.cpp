@@ -187,7 +187,7 @@ SPANIO_TEST(write_after_shutdown)
         tcp::socket server(*ctx);
         connect_pair(*ctx, acc, client, server);
 
-        SPANIO_REQUIRE(!client.shutdown(tcp::shutdown_send));
+        SPANIO_REQUIRE(!client.shutdown(tcp::shutdown_type::send));
         const std::error_code ec = write_once(*ctx, client, data);
         print_error("write after shutdown", ec);
         SPANIO_CHECK(ec == std::errc::broken_pipe);
@@ -240,15 +240,15 @@ SPANIO_TEST(write_after_peer_reset)
 // categories that share a value
 SPANIO_TEST(error_categories)
 {
-    const std::error_code eof = error::eof;
+    const std::error_code eof = error::misc_errors::eof;
     SPANIO_CHECK(std::string(eof.category().name()) == "spanio.misc");
-    const std::error_code not_found = error::host_not_found;
+    const std::error_code not_found = error::netdb_errors::host_not_found;
     SPANIO_CHECK(std::string(not_found.category().name()) == "spanio.netdb");
 
-    const std::vector<error::misc_errors> misc{error::eof,           error::message_too_large,
-                                               error::send_queue_full, error::framing_error,
-                                               error::handler_failed,  error::datagram_truncated,
-                                               error::idle_timeout,    error::close_timeout};
+    const std::vector<error::misc_errors> misc{error::misc_errors::eof,           error::misc_errors::message_too_large,
+                                               error::misc_errors::send_queue_full, error::misc_errors::framing_error,
+                                               error::misc_errors::handler_failed,  error::misc_errors::datagram_truncated,
+                                               error::misc_errors::idle_timeout,    error::misc_errors::close_timeout};
     for (error::misc_errors value : misc)
     {
         const std::error_code ec = value;
@@ -262,9 +262,9 @@ SPANIO_TEST(error_categories)
         SPANIO_CHECK(ec.message() != kMiscUnknownText);
     }
 
-    const std::vector<error::netdb_errors> netdb{error::host_not_found, error::host_not_found_try_again,
-                                                 error::no_data, error::no_recovery,
-                                                 error::service_not_found};
+    const std::vector<error::netdb_errors> netdb{error::netdb_errors::host_not_found, error::netdb_errors::host_not_found_try_again,
+                                                 error::netdb_errors::no_data, error::netdb_errors::no_recovery,
+                                                 error::netdb_errors::service_not_found};
     for (error::netdb_errors value : netdb)
     {
         const std::error_code ec = value;
@@ -281,7 +281,7 @@ SPANIO_TEST(error_categories)
     // eof and host_not_found are both value 1 in different categories
     SPANIO_CHECK(eof.value() == not_found.value());
     SPANIO_CHECK(eof != not_found);
-    SPANIO_CHECK(!(eof == error::host_not_found));
+    SPANIO_CHECK(!(eof == error::netdb_errors::host_not_found));
     // A SpanIO code never equals a system condition with the same value
     SPANIO_CHECK(eof != std::make_error_code(std::errc::operation_canceled));
 }
@@ -332,7 +332,7 @@ SPANIO_TEST(normalize_platform_codes)
 #endif
     // Codes of other categories are never touched, even with a value that
     // happens to match a platform code
-    const std::error_code eof = error::eof;
+    const std::error_code eof = error::misc_errors::eof;
     SPANIO_CHECK(normalize_error(eof) == eof);
     SPANIO_CHECK(!normalize_error(std::error_code()));
 #if defined(SPANIO_PLATFORM_WINDOWS)

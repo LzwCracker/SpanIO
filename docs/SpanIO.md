@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.17（设计草案，按 M1 实现修订）
+> 版本：v0.18（设计草案，按 M1 实现修订；库版本 0.3.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.18 修订记录（2026-11-10）**：冻结 API，库版本 0.3.0。
+> - 新增 6.11：冻结范围、修改规则、同步接口的错误报告方式；新增 `include/spanio/spanio.h` 与 `include/spanio/version.h`。
+> - 枚举统一为 `enum class`（`tcp::shutdown_type::send`、`error::misc_errors::eof`、`error::netdb_errors::host_not_found`）；`tcp_connection::context()` 改名 `user_data()`；`io_context` 内部接口私有化；新增 `native_handle_type`；内部常量移入 `detail`。
+> - 6.2：新增 `tcp::socket::async_read`（读满缓冲区）。
+> - 十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.17 修订记录（2026-11-09）**：统一错误码。
 > - 新增 6.10：错误码一览；所有系统错误经 `detail::normalize_error()` 统一，Windows 的 `WSAESHUTDOWN / WSAENOTSOCK / ERROR_NETNAME_DELETED / ERROR_CONNECTION_REFUSED` 转为对应的 `std::errc`。
@@ -17,7 +23,7 @@
 > - 十 / 十二：同步工程结构和 M3 进度。
 >
 > **v0.14 修订记录（2026-11-07）**：服务端超时与优雅关闭。
-> - 6.5：`tcp_server_options` 增加 `m_idle_timeout`（默认关闭）和 `m_close_timeout`（默认 30 秒），新增 `stop_gracefully(grace)`；新增错误码 `error::idle_timeout / close_timeout`。
+> - 6.5：`tcp_server_options` 增加 `m_idle_timeout`（默认关闭）和 `m_close_timeout`（默认 30 秒），新增 `stop_gracefully(grace)`；新增错误码 `error::misc_errors::idle_timeout / close_timeout`。
 > - 6.5：逗留关闭：数据发完后先等对端关闭（最多 2 秒）再关闭 socket。修复了优雅关闭期间对端仍在发数据时，本端关闭触发 RST、对端丢失数据的问题（Linux 上稳定复现）。
 > - 6.7：`udp_server` 新增 `stop_gracefully(grace)`。
 > - 十 / 十二：同步工程结构和 M3 进度。
@@ -39,7 +45,7 @@
 > **v0.10 修订记录（2026-11-06）**：实现 `udp::socket`。
 > - 新增 6.6：`udp::socket` 的接口、约定和平台差异。
 > - 4.4：`io_proactor` 增加数据报操作 `kRecvFrom / kSendTo`（`prepare_receive_from / prepare_send_to`）。
-> - `endpoint` 移到 `ip.h`，新增错误码 `error::datagram_truncated`。
+> - `endpoint` 移到 `ip.h`，新增错误码 `error::misc_errors::datagram_truncated`。
 > - 十 / 十二：同步工程结构和 M2 进度。
 >
 > **v0.9 修订记录（2026-11-06）**：`examples/echo_server.cpp` 改为基于 `tcp_server` 实现。
@@ -52,7 +58,7 @@
 >
 > **v0.7 修订记录（2026-11-05）**：增加高层服务端封装 `tcp_server`。
 > - 新增 6.5：`tcp_server`、`tcp_connection`、`tcp_server_options` 与 `framing.h` 的接口、约定和限制。
-> - 新增错误码 `error::message_too_large / send_queue_full / framing_error / handler_failed`。
+> - 新增错误码 `error::misc_errors::message_too_large / send_queue_full / framing_error / handler_failed`。
 > - 十二：M2 的 `chat_server` 改为基于 `tcp_server` 实现；`udp_server` 在 `udp::socket` 之后实现。
 > - 十：同步工程结构。
 >
@@ -406,7 +412,7 @@ v0.4 确定的语义：
 - `scheduler_op` 是侵入式链表节点，用函数指针分发（无虚函数），run 或 destroy 恰好一次，两者都释放节点。
 - IO 操作节点 `io_op<Handler>` 同时继承 `io_operation` 与 `scheduler_op`：同一个堆对象先交给 proactor，完成后由 `static_cast` 转回并放入任务队列，**不需要额外分配**，`io_operation` 的定义也不用改。
 - 被丢弃的 accept 操作会关闭已接受的 socket，避免泄漏。
-- 供 IO 对象（`tcp::socket` 等）使用的内部接口：`register_handle / unregister_handle / cancel_handle / start_io(io_op_base*)`。
+- 供 IO 对象（`tcp::socket` 等）使用的内部接口：`register_handle / unregister_handle / cancel_handle / start_io(io_op_base*) / schedule_timer / cancel_timer`。v0.18 起它们是 `io_context` 的私有成员，只能经 `detail::context_access` 调用，不属于公开 API。
 
 用户回调由 `io_context` 在完成事件到达时调用；此时数据已在用户缓冲区（Proactor 语义）。
 
@@ -428,7 +434,7 @@ io_context ──┬── tcp::acceptor  （监听 + accept）
 
 ### 6.2 核心 API（v0.5 已实现）
 
-实现见 `include/spanio/tcp.h`，辅助类型在 `ip.h`（`ip::address`、`ip::make_address`、`ipv4::any/loopback`、`ipv6::any/loopback`）、`buffer.h`（`mutable_buffer / const_buffer` 与 `spanio::buffer(...)`）、`error.h`（`spanio::error::eof`）。
+实现见 `include/spanio/tcp.h`，辅助类型在 `ip.h`（`ip::address`、`ip::make_address`、`ipv4::any/loopback`、`ipv6::any/loopback`）、`buffer.h`（`mutable_buffer / const_buffer` 与 `spanio::buffer(...)`）、`error.h`（`spanio::error::misc_errors::eof`）。
 
 ```cpp
 namespace spanio { namespace tcp {
@@ -440,17 +446,19 @@ class socket                                      // 只可移动
 public:
     explicit socket(io_context& ctx);
     std::error_code open(int family);             // async_connect 在未打开时会自动 open
-    std::error_code assign(native_handle_t handle);
+    using native_handle_type = ...;               // Windows 为 SOCKET，Linux 为 int
+    std::error_code assign(native_handle_type handle);
     bool is_open() const;
-    native_handle_t native_handle() const;
+    native_handle_type native_handle() const;
     endpoint local_endpoint(std::error_code& ec) const;
     endpoint remote_endpoint(std::error_code& ec) const;
-    std::error_code shutdown(shutdown_type what); // shutdown_receive / shutdown_send / shutdown_both
+    std::error_code shutdown(shutdown_type what); // shutdown_type::receive / send / both（enum class）
     void cancel();                                // 挂起操作以 operation_canceled 完成
     void close();                                 // 注销 → 取消 → 关闭；handler 仍恰好执行一次
 
     template <typename H> void async_connect(const endpoint& peer, H&& h);       // h(std::error_code)
     template <typename H> void async_read_some(mutable_buffer buf, H&& h);       // h(ec, n)，可能只读到一部分
+    template <typename H> void async_read(mutable_buffer buf, H&& h);            // h(ec, n)，读满整个缓冲区才回调；对端先关闭报 eof 和已读字节数（v0.18）
     template <typename H> void async_write_some(const_buffer buf, H&& h);        // h(ec, n)，可能只写出一部分
     template <typename H> void async_write(const_buffer buf, H&& h);             // h(ec, n)，写完全部或出错才回调
 };
@@ -476,11 +484,11 @@ public:
 
 | 约定        | 内容                                                                                              |
 | --------- | ----------------------------------------------------------------------------------------------- |
-| 命名        | 沿用 Asio：`async_read_some / async_write_some` 允许部分传输，`async_write` 是写完整个缓冲区的组合操作。v0.4 草图中的 `async_read` 实际是“读一部分”语义，已改名，避免误解为“读满缓冲区” |
+| 命名        | 沿用 Asio：`async_read_some / async_write_some` 允许部分传输；`async_read / async_write` 是读满 / 写完整个缓冲区的组合操作（`async_read` 在 v0.18 加入） |
 | 回调时机      | handler 一律在 `io_context::run()` 中执行，**从不在发起调用里内联执行**，包括立即失败（如 socket 未打开报 `bad_file_descriptor`）和空缓冲区（成功、0 字节） |
 | 恰好一次      | 每个发起的操作恰好回调一次；`close()`、`cancel()` 与析构使挂起操作以 `errc::operation_canceled` 完成                          |
-| 并发限制      | 每个 socket 同时最多一个读侧操作（read / accept）和一个写侧操作（connect / write），属于前置条件，不做运行时检查                  |
-| EOF       | 非空缓冲区读到 0 字节报告 `spanio::error::eof`                                                         |
+| 并发限制      | 每个 socket 同时最多一个读侧操作（read_some / read / accept）和一个写侧操作（connect / write_some / write），属于前置条件，不做运行时检查                  |
+| EOF       | 非空缓冲区读到 0 字节报告 `spanio::error::misc_errors::eof`                                                         |
 | 地址复用      | `acceptor::open()`：Linux 设置 `SO_REUSEADDR`（重启服务时可绑定处于 TIME_WAIT 的端口）；Windows 设置 `SO_EXCLUSIVEADDRUSE`。实测 Windows 的 `SO_REUSEADDR` 允许第二个 socket 绑定**正在监听**的端口，有端口劫持风险 |
 | 缓冲区生命周期   | `buffer` 不拥有内存，必须保持有效直到 handler 执行                                                       |
 
@@ -491,7 +499,7 @@ auto on_read = [&](std::error_code ec, std::size_t n)
 {
     if (ec)
     {
-        return; // spanio::error::eof 表示对端已正常关闭
+        return; // spanio::error::misc_errors::eof 表示对端已正常关闭
     }
     // 此时 buf 前 n 字节已是有效数据
 };
@@ -576,7 +584,7 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 | 组成                     | 内容                                                                                                 |
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
 | `tcp_server`           | 构造时完成绑定和监听，失败抛异常。`on_connect / on_message / on_close / set_framer` 须在启动前设置。`start()` 不阻塞，`run(n)` 阻塞且只能用于自带 context，`stop()` 可在任意线程调用 |
-| `tcp_connection`       | 由 `shared_ptr` 持有。`send()` 可在任意线程调用，内部排队；`close()` 发完再关，`abort()` 立即关；`context()` 用 `std::any` 挂业务数据 |
+| `tcp_connection`       | 由 `shared_ptr` 持有。`send()` 可在任意线程调用，内部排队；`close()` 发完再关，`abort()` 立即关；`user_data()` 用 `std::any` 挂业务数据（v0.18 前叫 `context()`，为避免和返回 `io_context&` 的 `context()` 混淆而改名） |
 | `tcp_server_options`   | 最大连接数、最大消息长度、发送队列字节上限、读缓冲大小、空闲超时、`close()` 超时                                                                        |
 | 分帧（`framing.h`）        | `line_framer()`、`length_prefix_framer()`、`encode_length_prefixed()`，也可传入任意函数对象                         |
 
@@ -587,8 +595,8 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 | 回调顺序    | `on_connect` 返回后才开始读；`on_close` 恰好一次且在最后                                                                                     |
 | 回调并发    | 同一连接的回调不并发；不同连接之间可能并发，共享数据要自己加锁，`run(1)` 除外                                                                                  |
 | 实现方式    | 每条连接有一条持续的读链，**所有回调都从读链发出**，写操作独立进行且不调用用户代码。读链结束且没有写操作在途时才触发 `on_close`                                                     |
-| 关闭原因    | `on_close` 的 `ec`：本端 `close()/abort()/stop()` 为空，对端关闭为 `error::eof`，超限或回调异常为 `error::message_too_large / send_queue_full / framing_error / handler_failed`，其余为系统错误码 |
-| 半关闭     | 对端只关闭发送方向（EOF）时，已排队的数据仍会发完再关闭，`ec` 为 `error::eof`                                                                           |
+| 关闭原因    | `on_close` 的 `ec`：本端 `close()/abort()/stop()` 为空，对端关闭为 `error::misc_errors::eof`，超限或回调异常为 `error::misc_errors::message_too_large / send_queue_full / framing_error / handler_failed`，其余为系统错误码 |
+| 半关闭     | 对端只关闭发送方向（EOF）时，已排队的数据仍会发完再关闭，`ec` 为 `error::misc_errors::eof`                                                                           |
 | 回调异常    | `on_connect / on_message` 抛异常时记录日志并关闭该连接，服务继续运行；`on_close` 的异常只记录                                                             |
 | 超过最大连接数 | 接受后立即关闭，不调用 `on_connect`（暂停接受会让客户端连上却没有响应，更难排查）                                                                               |
 | 写操作     | 不用 `async_write`，而是在连接锁内逐次 `async_write_some`：部分发送后继续时不能落到别的线程刚关闭的 socket 上。在途的队首数据等写操作返回后才释放                                  |
@@ -598,12 +606,12 @@ server.run(4);                   // 阻塞到 stop()，共 4 个线程
 
 | 功能                          | 约定                                                                                                  |
 | --------------------------- | --------------------------------------------------------------------------------------------------- |
-| 空闲超时 `m_idle_timeout`       | 默认关闭。连续这么久没有活动就关闭连接，`ec` 为 `error::idle_timeout`。“活动”指收到数据**或发送有进展**，所以只下载的客户端不会被误断                     |
-| `close()` 超时 `m_close_timeout` | 默认 30 秒。队列在时限内没发完就强制断开，`ec` 为 `error::close_timeout`；设为 0 表示一直等                                    |
+| 空闲超时 `m_idle_timeout`       | 默认关闭。连续这么久没有活动就关闭连接，`ec` 为 `error::misc_errors::idle_timeout`。“活动”指收到数据**或发送有进展**，所以只下载的客户端不会被误断                     |
+| `close()` 超时 `m_close_timeout` | 默认 30 秒。队列在时限内没发完就强制断开，`ec` 为 `error::misc_errors::close_timeout`；设为 0 表示一直等                                    |
 | `stop_gracefully(grace)`    | 立即停止接受，对每条连接 `close()`：不再投递 `on_message`，已排队数据发完再关；宽限期到了仍未关的强制断开（`close_timeout`），全部关闭后 `run()` 返回 |
 | `stop()`                    | 不变，立即关闭；宽限期内调用会立刻结束等待                                                                            |
 | 对端半关闭                       | 收到 EOF 时如果还有待发数据，同样受 `m_close_timeout` 限制                                                         |
-| 逗留关闭                        | 数据发完后只关闭发送方向，继续读取并丢弃对端发来的数据，等对端关闭后再关闭 socket，最多等 `close` 时限与 2 秒（`kLingerTimeout`）中较小者；到时直接关闭，`ec` 仍为空。原因：接收缓冲区里有未读数据时关闭 socket，系统会发 RST 而不是 FIN，对端可能丢掉刚发出的数据。因此 `close()` 后 `on_close` 要等对端关闭（正常客户端收到 FIN 会立即关闭），最多 2 秒 |
+| 逗留关闭                        | 数据发完后只关闭发送方向，继续读取并丢弃对端发来的数据，等对端关闭后再关闭 socket，最多等 `close` 时限与 2 秒（`detail::kLingerTimeout`）中较小者；到时直接关闭，`ec` 仍为空。原因：接收缓冲区里有未读数据时关闭 socket，系统会发 RST 而不是 FIN，对端可能丢掉刚发出的数据。因此 `close()` 后 `on_close` 要等对端关闭（正常客户端收到 FIN 会立即关闭），最多 2 秒 |
 
 实现：每条连接有一个空闲定时器和一个关闭定时器，访问都在连接锁内。空闲检测靠“最后活动时间”惰性重排：定时器到期时，如果期间有过活动就顺延到“最后活动时间 + 超时”，所以收发路径上只多一次原子写，不必每次重设定时器。连接关闭时取消两个定时器，因为挂起的等待会让连接一直存活，也会算作 `io_context` 的工作。
 
@@ -651,7 +659,7 @@ public:
 | ------ | ---------------------------------------------------------------------------------------- |
 | 消息边界   | 一次操作对应一个数据报，不会合并，也不会部分发送                                                                 |
 | 空数据报   | 0 字节是合法数据报，成功收发，UDP 没有 EOF；空接收缓冲区立即成功且不消耗数据报                                             |
-| 截断     | 缓冲区太小时报 `error::datagram_truncated`，`bytes` 为实际存入的字节数，其余丢失                                  |
+| 截断     | 缓冲区太小时报 `error::misc_errors::datagram_truncated`，`bytes` 为实际存入的字节数，其余丢失                                  |
 | 超大数据报  | 超过协议上限时发送报 `errc::message_size`，socket 继续可用                                               |
 | 自动打开   | `async_send_to` 在未打开时按目标地址族打开；`async_receive_from` 未打开时报 `bad_file_descriptor`                |
 | 发送者地址  | 通过回调参数传递，调用方不用自己保证地址对象的生命周期                                                              |
@@ -797,8 +805,8 @@ void async_connect(socket& sock, std::vector<endpoint> endpoints, H&& h);  // h(
 | 类别 | 内容 | 判断方式 |
 |---|---|---|
 | 系统错误（`std::system_category` / `generic`） | 操作系统报告的错误 | `ec == std::errc::xxx` |
-| `spanio.misc` | SpanIO 自己判定的情况 | `ec == spanio::error::eof` 等 |
-| `spanio.netdb` | 域名解析失败 | `ec == spanio::error::host_not_found` 等 |
+| `spanio.misc` | SpanIO 自己判定的情况 | `ec == spanio::error::misc_errors::eof` 等 |
+| `spanio.netdb` | 域名解析失败 | `ec == spanio::error::netdb_errors::host_not_found` 等 |
 
 **平台统一**：所有系统错误都经过 `detail::normalize_error()`（`socket_ops.h`）。Linux 的 `errno` 本来就能与 `std::errc` 比较，原样保留；Windows 上 C++ 标准库认不出的几个码被转换：
 
@@ -817,15 +825,15 @@ void async_connect(socket& sock, std::vector<endpoint> endpoints, H&& h);  // h(
 | 取消、关闭 socket、定时器 `cancel()`、resolver `cancel()` | `errc::operation_canceled` |
 | 在未打开的 socket 上发起操作 | `errc::bad_file_descriptor` |
 | 对已打开的 socket 再 `open()` / `assign()` | `errc::invalid_argument` |
-| TCP 对端正常关闭（读到 0 字节） | `error::eof`；UDP 没有 EOF，空数据报是成功、0 字节 |
+| TCP 对端正常关闭（读到 0 字节） | `error::misc_errors::eof`；UDP 没有 EOF，空数据报是成功、0 字节 |
 | 连接被拒绝 | `errc::connection_refused` |
 | 对端重置连接：读，或重置后第一次失败的写 | `errc::connection_reset` |
 | 本端 `shutdown(发送)` 后再写 | `errc::broken_pipe` |
-| 数据报比接收缓冲区大 | `error::datagram_truncated` |
+| 数据报比接收缓冲区大 | `error::misc_errors::datagram_truncated` |
 | 地址已被占用 | `errc::address_in_use` |
-| `tcp_server` 的限制与回调异常 | `error::message_too_large / send_queue_full / framing_error / handler_failed / idle_timeout / close_timeout`；本端 `close()` / `abort()` / `stop()` 时 `on_close` 收到空错误码 |
+| `tcp_server` 的限制与回调异常 | `error::misc_errors::message_too_large / send_queue_full / framing_error / handler_failed / idle_timeout / close_timeout`；本端 `close()` / `abort()` / `stop()` 时 `on_close` 收到空错误码 |
 | 域名解析 | `spanio.netdb` 的五个值；另有 `EAI_FAMILY / EAI_SOCKTYPE` → `address_family_not_supported`，`EAI_MEMORY` → `not_enough_memory`，`EAI_SYSTEM` → 当时的 `errno` |
-| `tcp::async_connect` 收到空地址列表 | `error::host_not_found` |
+| `tcp::async_connect` 收到空地址列表 | `error::netdb_errors::host_not_found` |
 
 **约定**（M3 评审确定）：
 - 重复打开用 `errc::invalid_argument`、空地址列表用 `host_not_found`，不另设 Asio 式的 `already_open` / `not_found`。
@@ -834,6 +842,39 @@ void async_connect(socket& sock, std::vector<endpoint> endpoints, H&& h);  // h(
 - 只出现在日志里、不会交给回调的错误码（`strand` 的 `state_not_recoverable`、`io_context` 析构超时的 `timed_out`）不在统一范围内。
 
 测试：`tests/test_errors.cpp`，5 个用例（`connect_sequence_cancel`、`write_after_shutdown`、`write_after_peer_reset` 在每个后端上各跑一遍；`error_categories`；`normalize_platform_codes`）。
+### 6.11 API 冻结（v0.18，版本 0.3.0）
+
+M3 结束时冻结公开 API，版本号定为 **0.3.0**（`include/spanio/version.h`：`SPANIO_VERSION_MAJOR / MINOR / PATCH`、`SPANIO_VERSION`、`SPANIO_MAKE_VERSION(a, b, c)`、`SPANIO_VERSION_STRING`）。
+
+| 项目 | 约定 |
+|---|---|
+| 冻结范围 | `spanio::` 命名空间中（不含 `spanio::detail::`）的类型、函数、回调签名，以及 6.10 的错误码约定 |
+| 不冻结 | `spanio::detail::` 的一切；参数为 `detail` 类型的测试用构造函数：`io_context(io_proactor_ptr)`、`basic_resolver(ctx, resolve_function)` |
+| 冻结后的修改 | 只做兼容增加（新函数、新选项字段、新重载）；破坏现有代码的修改（改名、删除、改签名）要升主版本号 |
+| 二进制兼容 | 只有头文件，不承诺 ABI |
+| 入口头文件 | `#include "spanio/spanio.h"`（位于 `include/spanio/spanio.h`）包含全部公开头文件；也可以只包含单个头文件 |
+
+**同步接口的错误报告方式**：
+
+- 没有返回值的操作返回 `std::error_code`：`open`、`bind`、`listen`、`shutdown`、`assign`。
+- 有返回值的操作用 `ec` 输出参数：`local_endpoint(ec)`、`remote_endpoint(ec)`、`resolve(..., ec)`、`make_address(text, ec)`。
+- 构造函数失败时抛出 `std::system_error`：`acceptor(ctx, ep)`、`tcp_server(port)`、`udp_server(port)`、`io_context()`。
+- 不带 `ec` 的便捷版本失败时抛异常：`make_address(string)`。
+
+**冻结前做的调整**（破坏性修改，以后不再发生）：
+
+| 调整 | 原写法 | 新写法 |
+|---|---|---|
+| 枚举一律用 `enum class` | `tcp::shutdown_send`、`error::eof`、`error::host_not_found` | `tcp::shutdown_type::send`、`error::misc_errors::eof`、`error::netdb_errors::host_not_found` |
+| 连接的用户数据改名 | `tcp_connection::context()` | `tcp_connection::user_data()`（`std::any&`） |
+| `io_context` 内部接口私有化 | `ctx.register_handle(...)` 等 | 只能经 `detail::context_access` 调用 |
+| 原生句柄类型 | `detail::native_handle_t` | `tcp::socket / tcp::acceptor / udp::socket::native_handle_type`；`ip::endpoint::native_size_type` |
+| 内部常量移入 `detail` | `tcp::kSocketOptionOn`、`ip::kV4AddressBytes` 等、`spanio::kLingerTimeout`、`kDefault*` | 默认值见各选项结构体的初始值；保留公开的只有 `tcp::kDefaultBacklog`、`kLengthHeaderBytes`、`kMaxUdpPayload` |
+| 新增读满 | 无 | `tcp::socket::async_read(buf, h)` |
+
+**冻结后可兼容增加的功能**：常用 socket 选项（`TCP_NODELAY`、keepalive、收发缓冲区）、已连接模式的 UDP 与 `udp::socket::assign`、同步等待接口、future / 协程风格的完成令牌（M5）、`tcp_server` 的广播与连接遍历。
+
+测试：`tests/test_api.cpp`，7 个用例（`umbrella_header`、`internals_not_public`、`native_handle_type`、`async_read_exact`、`async_read_eof`、`async_read_edge_cases`、`user_data`；`async_read` 的三个用例在每个后端上各跑一遍）。多数检查在编译期完成：内部接口重新公开、枚举改回普通枚举、移入 `detail` 的常量名重新出现在公开命名空间，都会使这个文件编译失败。
 
 ## 七、轻量易用设计
 
@@ -870,7 +911,7 @@ public:
         {
             if (ec)
             {
-                return; // spanio::error::eof：对端关闭；self 释放后 socket 自动关闭
+                return; // spanio::error::misc_errors::eof：对端关闭；self 释放后 socket 自动关闭
             }
             auto on_written = [self](std::error_code write_ec, std::size_t)
             {
@@ -988,11 +1029,12 @@ spanio/
 ├── CMakeLists.txt
 ├── include/
 │   └── spanio/
-│       ├── spanio.h                # 总入口
+│       ├── spanio.h                # 总入口：包含全部公开头文件（已实现，用法 #include "spanio/spanio.h"）
 │       ├── io_context.h            # 执行引擎：事件循环、任务队列、executor、work guard（已实现）
 │       ├── executor.h              # 执行器抽象
 │       ├── strand.h                # 串行化域 strand、make_strand、bind_executor（已实现）
-│       ├── error.h                 # SpanIO 自有错误码（error::eof）（已实现）
+│       ├── version.h               # 版本号宏 SPANIO_VERSION_*（已实现，0.3.0）
+│       ├── error.h                 # SpanIO 自有错误码（error::misc_errors::eof）（已实现）
 │       ├── buffer.h                # 缓冲区抽象 mutable_buffer / const_buffer（已实现）
 │       ├── ip.h                    # ip::address、ipv4 / ipv6 常用地址（已实现）
 │       ├── tcp.h                   # TCP 接口：endpoint、socket、acceptor（已实现）
@@ -1039,6 +1081,7 @@ spanio/
 │   ├── test_resolver.cpp       # 域名解析测试（已实现）
 │   ├── test_strand.cpp         # strand 与 bind_executor 测试（已实现）
 │   ├── test_errors.cpp         # 统一错误码测试（已实现）
+│   ├── test_api.cpp            # API 冻结守护测试与 async_read 测试（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
 │   └── bench_throughput.cpp
@@ -1132,7 +1175,7 @@ v0.6 验证情况：
 | ------- | ----------------------------------------------- | ------------------ |
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
-| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand、错误码统一已完成；剩 API 冻结与文档收尾） |
+| M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（timer、服务端超时与优雅关闭、resolver、strand、错误码统一、API 冻结（0.3.0）已完成；剩使用文档） |
 | M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 

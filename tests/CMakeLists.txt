@@ -25,6 +25,7 @@ set(SPANIO_TEST_NAMES
     test_resolver
     test_strand
     test_errors
+    test_api
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)

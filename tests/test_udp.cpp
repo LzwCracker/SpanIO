@@ -491,7 +491,7 @@ SPANIO_TEST(truncated_datagram)
             SPANIO_CHECK(ctx->run() == 1);
             ctx->restart();
             SPANIO_CHECK(received.m_calls == 1);
-            SPANIO_CHECK(received.m_ec == spanio::error::datagram_truncated);
+            SPANIO_CHECK(received.m_ec == spanio::error::misc_errors::datagram_truncated);
             SPANIO_CHECK(received.m_bytes == kSmallBufferSize);
             SPANIO_CHECK(std::memcmp(short_buffer, long_datagram.data(), kSmallBufferSize) == 0);
             SPANIO_CHECK(received.m_sender == bound_endpoint(sender));
@@ -506,7 +506,7 @@ SPANIO_TEST(truncated_datagram)
             SPANIO_CHECK(ctx->run() == 2);
             ctx->restart();
             SPANIO_CHECK(received.m_calls == 1);
-            SPANIO_CHECK(received.m_ec == spanio::error::datagram_truncated);
+            SPANIO_CHECK(received.m_ec == spanio::error::misc_errors::datagram_truncated);
             SPANIO_CHECK(received.m_bytes == kSmallBufferSize);
         }
 

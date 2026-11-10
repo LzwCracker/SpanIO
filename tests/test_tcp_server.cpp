@@ -684,7 +684,7 @@ SPANIO_TEST(callback_order)
 
         SPANIO_REQUIRE(closes.wait_for(1));
         SPANIO_CHECK(wait_for_connections(fixture.server(), 0));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::eof);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::eof);
 
         std::lock_guard<std::mutex> lock(events_mutex);
         const std::string expected_message = "message:" + std::string(kPing);
@@ -721,12 +721,12 @@ SPANIO_TEST(callbacks_never_overlap_per_connection)
         };
         auto state_of = [](const tcp_connection_ptr& connection)
         {
-            return std::any_cast<overlap_state_ptr>(connection->context());
+            return std::any_cast<overlap_state_ptr>(connection->user_data());
         };
         auto on_connect = [&](const tcp_connection_ptr& connection)
         {
             overlap_state_ptr state = std::make_shared<overlap_state>();
-            connection->context() = state;
+            connection->user_data() = state;
             hold_busy(state);
         };
         auto on_message = [&](const tcp_connection_ptr& connection, std::string_view data)
@@ -916,12 +916,12 @@ SPANIO_TEST(close_flushes_pending_sends)
             socket_guard client;
             SPANIO_REQUIRE(connect_client(fixture.port(), client));
             SPANIO_REQUIRE(send_all(client.get(), kPing, kPingLength));
-            SPANIO_REQUIRE(::shutdown(client.get(), static_cast<int>(spanio::tcp::shutdown_send)) == 0);
+            SPANIO_REQUIRE(::shutdown(client.get(), static_cast<int>(spanio::tcp::shutdown_type::send)) == 0);
             std::string received;
             SPANIO_CHECK(recv_until_closed(client.get(), received));
             SPANIO_CHECK(received == payload);
             SPANIO_REQUIRE(closes.wait_for(1));
-            SPANIO_CHECK(closes.reason(0) == spanio::error::eof);
+            SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::eof);
         }
     }
 }
@@ -1049,7 +1049,7 @@ SPANIO_TEST(message_too_large_closes)
         const std::string long_input(kUnterminatedSize, 'x');
         SPANIO_REQUIRE(send_all(unterminated.get(), long_input.data(), long_input.size()));
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::message_too_large);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::message_too_large);
         SPANIO_CHECK(sees_close(unterminated.get()));
 
         // A complete line that is itself too long
@@ -1058,7 +1058,7 @@ SPANIO_TEST(message_too_large_closes)
         const std::string line = std::string(kLongLineSize, 'y') + "\n";
         SPANIO_REQUIRE(send_all(long_line.get(), line.data(), line.size()));
         SPANIO_REQUIRE(closes.wait_for(2));
-        SPANIO_CHECK(closes.reason(1) == spanio::error::message_too_large);
+        SPANIO_CHECK(closes.reason(1) == spanio::error::misc_errors::message_too_large);
 
         const std::string request = std::string(kPing) + "\n";
         char reply[kPingLength + 1] = {};
@@ -1115,7 +1115,7 @@ SPANIO_TEST(send_queue_overflow_closes)
         }
         SPANIO_REQUIRE(refused);
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::send_queue_full);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::send_queue_full);
         SPANIO_CHECK(ping(bystander.get()));
     }
 }
@@ -1195,7 +1195,7 @@ SPANIO_TEST(handler_exception_closes_one_connection)
         const std::string boom = "boom";
         SPANIO_REQUIRE(send_all(victim.get(), boom.data(), boom.size()));
         SPANIO_REQUIRE(closes.wait_for(1));
-        SPANIO_CHECK(closes.reason(0) == spanio::error::handler_failed);
+        SPANIO_CHECK(closes.reason(0) == spanio::error::misc_errors::handler_failed);
         SPANIO_CHECK(sees_close(victim.get()));
 
         SPANIO_CHECK(ping(bystander.get()));
@@ -1285,9 +1285,9 @@ SPANIO_TEST(peer_reset_reports_error)
     }
 }
 
-// Case 17: tcp_connection::context keeps user data across the callbacks of
+// Case 17: tcp_connection::user_data keeps user data across the callbacks of
 // one connection
-SPANIO_TEST(connection_context_keeps_user_data)
+SPANIO_TEST(connection_user_data_kept)
 {
     for (const backend_factory& backend : backends())
     {
@@ -1297,16 +1297,16 @@ SPANIO_TEST(connection_context_keeps_user_data)
         server_fixture fixture(backend);
         auto on_connect = [](const tcp_connection_ptr& connection)
         {
-            connection->context() = 0;
+            connection->user_data() = 0;
         };
         auto on_message = [](const tcp_connection_ptr& connection, std::string_view data)
         {
-            ++std::any_cast<int&>(connection->context());
+            ++std::any_cast<int&>(connection->user_data());
             connection->send(data);
         };
         auto on_close = [&](const tcp_connection_ptr& connection, std::error_code reason)
         {
-            counted = std::any_cast<int>(connection->context());
+            counted = std::any_cast<int>(connection->user_data());
             closes.add(reason);
         };
         fixture.server().on_connect(on_connect);
