@@ -26,10 +26,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using spanio::io_context;
@@ -98,6 +102,30 @@ constexpr std::uint16_t kExplicitPort = 9000;
 
 // Thread count given on the command line in the argument case ("3")
 constexpr unsigned kExplicitThreads = 3;
+
+// Message of the log cases
+constexpr char kLogMessage[] = "hello";
+
+// Its length without the terminating zero
+constexpr std::size_t kLogMessageLength = sizeof(kLogMessage) - 1;
+
+// Message with control characters: "a\r\nb" and the byte 0x01
+constexpr char kControlMessage[] = "a\r\nb\x01";
+
+// Its length without the terminating zero
+constexpr std::size_t kControlMessageLength = sizeof(kControlMessage) - 1;
+
+// How the log shows kControlMessage
+constexpr char kControlEscaped[] = "a\\r\\nb\\x01";
+
+// Size of the message that the log truncates
+constexpr std::size_t kLongMessageSize = 200;
+
+// Messages each client sends in the interleaving case
+constexpr int kLogMessagesPerClient = 50;
+
+// Port used by the address formatting case
+constexpr std::uint16_t kFormatPort = 8080;
 
 // Clock used for time measurements
 using test_clock = std::chrono::steady_clock;
@@ -217,11 +245,119 @@ private:
 
 // Create a server on 127.0.0.1 with a system-picked port, or fail the case
 // Parameter context: context for the server
+// Parameter sink:    where its log lines go; empty (the default) for none
 // Return value: the server, not started yet
-std::unique_ptr<echo::echo_server> make_server(io_context& context)
+std::unique_ptr<echo::echo_server> make_server(io_context& context, echo::log_sink sink = echo::log_sink())
 {
-    return std::unique_ptr<echo::echo_server>(
-        new echo::echo_server(context, spanio::tcp::endpoint(spanio::ipv4::loopback(), kAnyPort)));
+    return std::unique_ptr<echo::echo_server>(new echo::echo_server(
+        context, spanio::tcp::endpoint(spanio::ipv4::loopback(), kAnyPort), std::move(sink)));
+}
+
+// Collects the server's log lines; safe to read while the server writes
+class log_capture
+{
+public:
+    // A sink that appends to this capture; the capture must outlive it. It
+    // also counts calls that overlap: the server must hand lines to its sink
+    // one at a time (stdout has no lock of its own), so a capture that only
+    // relied on its own mutex would hide a missing lock in the server.
+    // Return value: the sink
+    echo::log_sink sink()
+    {
+        auto add = [this](const std::string& line)
+        {
+            if (m_inside.fetch_add(1) != 0)
+            {
+                m_overlaps.fetch_add(1);
+            }
+            // Widen the window in which an unserialized second call would
+            // overlap this one
+            std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_lines.push_back(line);
+            }
+            m_inside.fetch_sub(1);
+        };
+        return echo::log_sink(add);
+    }
+
+    // Number of sink calls that started while another was still running
+    // Return value: the count; 0 when the server serializes its lines
+    int overlaps() const
+    {
+        return m_overlaps.load();
+    }
+
+    // The lines so far
+    // Return value: a copy
+    std::vector<std::string> lines() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_lines;
+    }
+
+    // Lines that contain a text
+    // Parameter text: text to look for, e.g. an event tag
+    // Return value: the matching lines, in order
+    std::vector<std::string> with(const std::string& text) const
+    {
+        std::vector<std::string> found;
+        for (const std::string& line : lines())
+        {
+            if (line.find(text) != std::string::npos)
+            {
+                found.push_back(line);
+            }
+        }
+        return found;
+    }
+
+    // Wait until at least a number of lines contain a text
+    // Parameter text:  text to look for
+    // Parameter count: lines needed
+    // Return value: true if they appeared within kSessionWaitMs
+    bool wait_for(const std::string& text, std::size_t count) const
+    {
+        const test_clock::time_point start = test_clock::now();
+        while (with(text).size() < count)
+        {
+            if (elapsed_ms(start) > kSessionWaitMs)
+            {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+        }
+        return true;
+    }
+
+private:
+    // Guards m_lines
+    mutable std::mutex m_mutex;
+    // Lines in the order they were written
+    std::vector<std::string> m_lines;
+    // Sink calls running right now
+    std::atomic<int> m_inside{0};
+    // Sink calls that found another one running
+    std::atomic<int> m_overlaps{0};
+};
+
+// Address text the server logs for a connected test client
+// Parameter client: connected blocking client
+// Return value: "127.0.0.1:<client port>"
+std::string client_peer(const socket_guard& client)
+{
+    const sockaddr_in local = spanio::test::local_address(client.get());
+    return "127.0.0.1:" + std::to_string(static_cast<unsigned>(ntohs(local.sin_port)));
+}
+
+// Whether a line has the log format: time, tag, peer, two spaces, detail
+// Parameter line: the line
+// Return value: true when well-formed and free of line breaks
+bool well_formed(const std::string& line)
+{
+    static const std::regex format(R"(^\d{2}:\d{2}:\d{2}\.\d{3} \[(connect|recv|close)\] +[^ ]+  \S.*$)");
+    return line.find_first_of("\r\n") == std::string::npos && std::regex_match(line, format);
 }
 
 }
@@ -422,6 +558,296 @@ SPANIO_TEST(parse_arguments)
     error.clear();
     SPANIO_CHECK(!echo::parse_arguments(argc_of(too_many), too_many, opts, error));
     SPANIO_CHECK(!error.empty());
+}
+
+// Case 7: a client that connects is logged with its address and the online
+// count
+SPANIO_TEST(log_connect)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+        server_runner runner(*ctx, *server, kSingleThread);
+        socket_guard client;
+        SPANIO_REQUIRE(connect_client(server_port(*server), client));
+
+        SPANIO_REQUIRE(log.wait_for("[connect]", 1));
+        const std::string line = log.with("[connect]").front();
+        SPANIO_CHECK(well_formed(line));
+        SPANIO_CHECK(line.find(" [connect] " + client_peer(client) + "  online 1") != std::string::npos);
+    }
+}
+
+// Case 8: received data is logged with its size and text, and still echoed
+SPANIO_TEST(log_message)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+        server_runner runner(*ctx, *server, kSingleThread);
+        socket_guard client;
+        SPANIO_REQUIRE(connect_client(server_port(*server), client));
+
+        SPANIO_CHECK(send_all(client.get(), kLogMessage, kLogMessageLength));
+        char reply[kLogMessageLength] = {};
+        SPANIO_CHECK(recv_exact(client.get(), reply, kLogMessageLength));
+        SPANIO_CHECK(std::memcmp(reply, kLogMessage, kLogMessageLength) == 0);
+
+        SPANIO_REQUIRE(log.wait_for("[recv]", 1));
+        const std::string line = log.with("[recv]").front();
+        SPANIO_CHECK(well_formed(line));
+        SPANIO_CHECK(line.find(" [recv]    " + client_peer(client) + "  5 bytes: hello") != std::string::npos);
+    }
+}
+
+// Case 9: control characters are escaped, so one message is one line;
+// other bytes, such as UTF-8 text, are kept
+SPANIO_TEST(log_escapes)
+{
+    log_capture log;
+    std::unique_ptr<io_context> ctx = make_context(backends().front());
+    std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+    server_runner runner(*ctx, *server, kSingleThread);
+    socket_guard client;
+    SPANIO_REQUIRE(connect_client(server_port(*server), client));
+
+    SPANIO_CHECK(send_all(client.get(), kControlMessage, kControlMessageLength));
+    char reply[kControlMessageLength] = {};
+    SPANIO_CHECK(recv_exact(client.get(), reply, kControlMessageLength));
+
+    SPANIO_REQUIRE(log.wait_for("[recv]", 1));
+    for (const std::string& line : log.lines())
+    {
+        SPANIO_CHECK(well_formed(line));
+    }
+    const std::string line = log.with("[recv]").front();
+    SPANIO_CHECK(line.find("5 bytes: " + std::string(kControlEscaped)) != std::string::npos);
+
+    // The escaping rules themselves
+    SPANIO_CHECK(echo::escape_bytes(std::string_view("\t\\\x7f", 3)) == "\\t\\\\\\x7F");
+    SPANIO_CHECK(echo::escape_bytes("\xE4\xB8\xAD\xE6\x96\x87") == "\xE4\xB8\xAD\xE6\x96\x87");
+    SPANIO_CHECK(echo::escape_bytes("") == "");
+}
+
+// Case 10: a long message shows only its first 64 bytes and its size
+SPANIO_TEST(log_long_message_truncated)
+{
+    log_capture log;
+    std::unique_ptr<io_context> ctx = make_context(backends().front());
+    std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+    server_runner runner(*ctx, *server, kSingleThread);
+    socket_guard client;
+    SPANIO_REQUIRE(connect_client(server_port(*server), client));
+
+    const std::string message(kLongMessageSize, 'x');
+    SPANIO_CHECK(send_all(client.get(), message.data(), message.size()));
+    std::string reply(kLongMessageSize, '\0');
+    SPANIO_CHECK(recv_exact(client.get(), &reply[0], reply.size()));
+
+    SPANIO_REQUIRE(log.wait_for("[recv]", 1));
+    const std::string line = log.with("[recv]").front();
+    const std::string expected = "200 bytes: " + std::string(echo::kShownBytes, 'x') + "... (200 bytes)";
+    SPANIO_CHECK(line.size() >= expected.size());
+    SPANIO_CHECK(line.compare(line.size() - expected.size(), expected.size(), expected) == 0);
+
+    // A cut never splits a UTF-8 character: 63 ASCII bytes and a 3-byte
+    // character show only the 63 bytes
+    const std::string utf8 = std::string(echo::kShownBytes - 1, 'a') + "\xE4\xB8\xAD";
+    SPANIO_CHECK(echo::escape_bytes(utf8) == std::string(echo::kShownBytes - 1, 'a') + "... (66 bytes)");
+}
+
+// Case 11: a client that disconnects is logged as "client closed", with the
+// bytes it sent and the online count back at 0
+SPANIO_TEST(log_client_close)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+        server_runner runner(*ctx, *server, kSingleThread);
+        socket_guard client;
+        SPANIO_REQUIRE(connect_client(server_port(*server), client));
+        const std::string peer = client_peer(client);
+
+        SPANIO_CHECK(send_all(client.get(), kLogMessage, kLogMessageLength));
+        char reply[kLogMessageLength] = {};
+        SPANIO_CHECK(recv_exact(client.get(), reply, kLogMessageLength));
+        client.reset();
+
+        SPANIO_REQUIRE(log.wait_for("[close]", 1));
+        const std::string line = log.with("[close]").front();
+        SPANIO_CHECK(well_formed(line));
+        SPANIO_CHECK(line.find(" [close]   " + peer + "  client closed, 5 bytes received, connected ")
+                     != std::string::npos);
+        SPANIO_CHECK(line.find(" s, online 0") != std::string::npos);
+    }
+}
+
+// Case 12: stopping the server with a client connected logs "server closed"
+SPANIO_TEST(log_server_stop)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+        server_runner runner(*ctx, *server, kSingleThread);
+        socket_guard client;
+        SPANIO_REQUIRE(connect_client(server_port(*server), client));
+        SPANIO_REQUIRE(log.wait_for("[connect]", 1));
+
+        runner.stop_and_join();
+        const std::vector<std::string> closes = log.with("[close]");
+        SPANIO_REQUIRE(closes.size() == 1);
+        SPANIO_CHECK(well_formed(closes.front()));
+        SPANIO_CHECK(closes.front().find("server closed, 0 bytes received") != std::string::npos);
+    }
+}
+
+// Case 13: four threads, eight clients, fifty messages each: every line is
+// whole and well-formed, each client has one [connect] and one [close], and
+// the [recv] lines add up to every byte sent
+SPANIO_TEST(log_lines_not_interleaved)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        std::unique_ptr<echo::echo_server> server = make_server(*ctx, log.sink());
+        server_runner runner(*ctx, *server, kServerThreads);
+        const std::uint16_t port = server_port(*server);
+
+        std::atomic<int> failures(0);
+        auto run_client = [&](int id)
+        {
+            socket_guard client;
+            if (!connect_client(port, client))
+            {
+                ++failures;
+                return;
+            }
+            std::vector<char> message(kMessageSize);
+            std::vector<char> reply(kMessageSize);
+            for (int m = 0; m < kLogMessagesPerClient; ++m)
+            {
+                for (std::size_t i = 0; i < kMessageSize; ++i)
+                {
+                    message[i] = message_byte(id, m, i);
+                }
+                if (!send_all(client.get(), message.data(), kMessageSize)
+                    || !recv_exact(client.get(), reply.data(), kMessageSize) || reply != message)
+                {
+                    ++failures;
+                    return;
+                }
+            }
+        };
+        std::vector<std::thread> clients;
+        for (int id = 0; id < kConcurrentClients; ++id)
+        {
+            clients.emplace_back(run_client, id);
+        }
+        for (std::thread& client : clients)
+        {
+            client.join();
+        }
+        SPANIO_CHECK(failures.load() == 0);
+        SPANIO_CHECK(log.wait_for("[close]", static_cast<std::size_t>(kConcurrentClients)));
+        runner.stop_and_join();
+
+        std::size_t malformed = 0;
+        std::size_t received = 0;
+        for (const std::string& line : log.lines())
+        {
+            if (!well_formed(line))
+            {
+                ++malformed;
+            }
+        }
+        for (const std::string& line : log.with("[recv]"))
+        {
+            // "<peer>  <N> bytes: ...": N is the word just before " bytes: "
+            const std::size_t bytes_word = line.find(" bytes: ");
+            const std::size_t number = line.rfind(' ', bytes_word - 1) + 1;
+            received += std::strtoull(line.c_str() + number, nullptr, echo::kDecimalBase);
+        }
+        SPANIO_CHECK(malformed == 0);
+        SPANIO_CHECK(log.overlaps() == 0);
+        SPANIO_CHECK(log.with("[connect]").size() == static_cast<std::size_t>(kConcurrentClients));
+        SPANIO_CHECK(log.with("[close]").size() == static_cast<std::size_t>(kConcurrentClients));
+        SPANIO_CHECK(received == static_cast<std::size_t>(kConcurrentClients * kLogMessagesPerClient) * kMessageSize);
+    }
+}
+
+// Case 14: --quiet is accepted anywhere and turns the log off; unknown
+// options and extra values are rejected; a quiet server still echoes
+SPANIO_TEST(quiet_and_arguments)
+{
+    echo::options opts;
+    std::string error;
+
+    const char* const quiet_only[] = {"echo_server", "--quiet"};
+    SPANIO_CHECK(echo::parse_arguments(argc_of(quiet_only), quiet_only, opts, error));
+    SPANIO_CHECK(opts.m_quiet);
+    SPANIO_CHECK(opts.m_port == echo::kDefaultPort);
+
+    const char* const quiet_middle[] = {"echo_server", "9000", "--quiet", "3"};
+    SPANIO_CHECK(echo::parse_arguments(argc_of(quiet_middle), quiet_middle, opts, error));
+    SPANIO_CHECK(opts.m_quiet);
+    SPANIO_CHECK(opts.m_port == kExplicitPort);
+    SPANIO_CHECK(opts.m_threads == kExplicitThreads);
+
+    const char* const quiet_last[] = {"echo_server", "9000", "3", "--quiet"};
+    SPANIO_CHECK(echo::parse_arguments(argc_of(quiet_last), quiet_last, opts, error));
+    SPANIO_CHECK(opts.m_quiet);
+    SPANIO_CHECK(opts.m_threads == kExplicitThreads);
+
+    const char* const not_quiet[] = {"echo_server", "9000"};
+    SPANIO_CHECK(echo::parse_arguments(argc_of(not_quiet), not_quiet, opts, error));
+    SPANIO_CHECK(!opts.m_quiet);
+
+    const char* const unknown[] = {"echo_server", "--verbose"};
+    error.clear();
+    SPANIO_CHECK(!echo::parse_arguments(argc_of(unknown), unknown, opts, error));
+    SPANIO_CHECK(error.find("--verbose") != std::string::npos);
+
+    const char* const too_many[] = {"echo_server", "9000", "3", "--quiet", "4"};
+    error.clear();
+    SPANIO_CHECK(!echo::parse_arguments(argc_of(too_many), too_many, opts, error));
+    SPANIO_CHECK(!error.empty());
+
+    // Without a sink the log is off, and the server still echoes
+    SPANIO_CHECK(!echo::event_log(echo::log_sink()).enabled());
+    std::unique_ptr<io_context> ctx = make_context(backends().front());
+    std::unique_ptr<echo::echo_server> server = make_server(*ctx);
+    server_runner runner(*ctx, *server, kSingleThread);
+    socket_guard client;
+    SPANIO_REQUIRE(connect_client(server_port(*server), client));
+    SPANIO_CHECK(send_all(client.get(), kLogMessage, kLogMessageLength));
+    char reply[kLogMessageLength] = {};
+    SPANIO_CHECK(recv_exact(client.get(), reply, kLogMessageLength));
+    SPANIO_CHECK(std::memcmp(reply, kLogMessage, kLogMessageLength) == 0);
+}
+
+// Case 15: addresses are shown as a.b.c.d:port and [v6]:port
+SPANIO_TEST(format_endpoint)
+{
+    SPANIO_CHECK(echo::format_endpoint(spanio::tcp::endpoint(spanio::ipv4::loopback(), kFormatPort))
+                 == "127.0.0.1:8080");
+    SPANIO_CHECK(echo::format_endpoint(spanio::tcp::endpoint(spanio::ipv6::loopback(), kFormatPort))
+                 == "[::1]:8080");
+    SPANIO_CHECK(echo::format_endpoint(spanio::tcp::endpoint(spanio::ip::make_address("fe80::1"), kFormatPort))
+                 == "[fe80::1]:8080");
 }
 
 int main(int argc, char** argv)

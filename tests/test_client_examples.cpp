@@ -76,7 +76,7 @@ public:
     // Parameter backend: proactor backend of the server's context
     explicit tcp_echo_fixture(const backend_factory& backend)
         : m_context(make_context(backend))
-        , m_server(*m_context, spanio::tcp::endpoint(spanio::ipv4::loopback(), kAnyPort))
+        , m_server(*m_context, spanio::tcp::endpoint(spanio::ipv4::loopback(), kAnyPort), echo::log_sink())
     {
         m_server.start();
         spanio::io_context& context = *m_context;

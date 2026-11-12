@@ -1,7 +1,11 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.19（设计草案，按 M1 实现修订；库版本 0.3.0）
+> 版本：v0.20（设计草案，按 M1 实现修订；库版本 0.3.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.20 修订记录（2026-11-11）**：`echo_server` 示例打印连接日志。
+> - `examples/echo_server.cpp`：每个连接打印 `[connect]`（客户端 IP:端口、在线数）、`[recv]`（字节数与内容，控制字符转义，超过 64 字节截断）、`[close]`（断开原因、收到的总字节数、连接时长、在线数）；多线程下整行输出不交错；新增 `--quiet` 关闭输出。日志对象可替换输出目标，测试据此检查日志内容。
+> - `tests/test_echo_server.cpp` 新增 9 个用例（共 15 个）。
 >
 > **v0.19 修订记录（2026-11-10）**：使用指南，M3 完成。
 > - 新增 docs/guide.md：面向使用者的中文指南，19 段代码与 	ests/test_guide.cpp 逐字相同，由 CTest 测试 guide_snippets_match（	ests/check_guide_snippets.cmake）保证。
@@ -1069,7 +1073,7 @@ spanio/
 │    
 ├── examples/
 │   ├── CMakeLists.txt          # 示例构建（SPANIO_BUILD_EXAMPLES）（已实现）
-│   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务（已实现）
+│   ├── echo_server.cpp         # M1 验收示例：基于 tcp_server 的多线程回显服务，打印连接日志（已实现）
 │   ├── timer_demo.cpp          # 定时器示例（已实现）
 │   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 │   ├── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）

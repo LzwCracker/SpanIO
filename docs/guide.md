@@ -96,7 +96,7 @@ int main()
 }
 ```
 
-编译运行后，用 `nc localhost 8080`（或 `telnet`）连上去，输入什么就会收到什么。仓库里的 `examples/echo_server.cpp` 是带命令行参数的完整版本，`examples/tcp_client.cpp` 是对应的客户端。
+编译运行后，用 `nc localhost 8080`（或 `telnet`）连上去，输入什么就会收到什么。仓库里的 `examples/echo_server.cpp` 是完整版本：带命令行参数，并为每个连接打印连接、收到的数据和断开的日志（`--quiet` 关闭）；`examples/tcp_client.cpp` 是对应的客户端。
 
 ### 1.3 编译开关
 
@@ -805,7 +805,7 @@ for (std::thread& thread : threads)
 
 | 程序 | 用法 | 演示内容 |
 |---|---|---|
-| `echo_server` | `echo_server [端口] [线程数]` | `tcp_server` 最简用法 |
+| `echo_server` | `echo_server [端口] [线程数] [--quiet]` | `tcp_server` 的回显服务；打印每个连接的建立（客户端 IP:端口、在线数）、收到的数据和断开原因，`--quiet` 关闭输出 |
 | `chat_server` | `chat_server [端口] [线程数]` | 多用户聊天：行分帧、`user_data` 存昵称、广播 |
 | `udp_echo_server` | `udp_echo_server [端口]` | `udp_server` |
 | `timer_demo` | `timer_demo` | `steady_timer` 在回调里重新等待，每半秒打印一次，三次后退出 |
@@ -815,7 +815,7 @@ for (std::thread& thread : threads)
 试一试：
 
 ```sh
-echo_server 8080 &
+echo_server 8080 &          # 打印 [connect] / [recv] / [close]
 tcp_client localhost 8080 hello
 udp_echo_server 9000 &
 udp_client localhost 9000 hello
