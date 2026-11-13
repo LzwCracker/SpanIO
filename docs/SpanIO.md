@@ -1,7 +1,12 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.20（设计草案，按 M1 实现修订；库版本 0.3.0）
+> 版本：v0.21（设计草案，按 M1 实现修订；库版本 0.3.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.21 修订记录（2026-11-13）**：M4 基准测试。
+> - 新增 `benchmark/`：基准程序 `bench_spanio`（8 个场景，CMake 选项 `SPANIO_BUILD_BENCHMARKS`，默认关闭）、结果对比脚本 `compare.cmake`、0.3.0 基线 `benchmark/results/`；新增测试 `tests/test_benchmark.cpp`。
+> - 新增报告 `docs/benchmark.md`：测试方法、两个平台的基线、瓶颈分析与 M4 优化顺序（首要瓶颈：`io_context` 任务队列在多线程下的锁争用）。
+> - 十 / 十二：同步工程结构和 M4 进度。
 >
 > **v0.20 修订记录（2026-11-11）**：`echo_server` 示例打印连接日志。
 > - `examples/echo_server.cpp`：每个连接打印 `[connect]`（客户端 IP:端口、在线数）、`[recv]`（字节数与内容，控制字符转义，超过 64 字节截断）、`[close]`（断开原因、收到的总字节数、连接时长、在线数）；多线程下整行输出不交错；新增 `--quiet` 关闭输出。日志对象可替换输出目标，测试据此检查日志内容。
@@ -1095,13 +1100,19 @@ spanio/
 │   ├── test_api.cpp            # API 冻结守护测试与 async_read 测试（已实现）
 │   ├── test_client_examples.cpp # 两个客户端示例的测试（已实现）
 │   ├── test_guide.cpp          # 使用指南中每段代码的编译与运行（已实现）
+│   ├── test_benchmark.cpp      # 基准程序自身的测试（已实现）
 │   ├── check_guide_snippets.cmake # 比对指南代码块与 test_guide.cpp（CTest：guide_snippets_match）（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
-│   └── bench_throughput.cpp
+│   ├── CMakeLists.txt          # SPANIO_BUILD_BENCHMARKS（默认关闭）（已实现）
+│   ├── bench_spanio.cpp        # 基准程序：8 个场景（已实现）
+│   ├── bench_common.h          # 统计、CSV、环境信息（已实现）
+│   ├── compare.cmake           # 两份结果对比，变差超过阈值即失败（已实现）
+│   └── results/                # 各版本的基线结果 CSV（0.3.0 已有）
 └── docs/
 │     ├── SpanIO.md               # 设计文档（本文）
 │     ├── guide.md                # 使用指南（已实现）
+│     ├── benchmark.md            # 基准测试报告（0.3.0 基线）（已实现）
 │     ├── code_rule.md            # 编码规范
 │     └── git_code_rule.md        # 提交规范
 └── spanio_demo.sln   
@@ -1193,7 +1204,7 @@ v0.6 验证情况：
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
-| M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告             |
+| M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告（进行中：基准程序与 0.3.0 基线已完成，见 `docs/benchmark.md`；下一步优化 `io_context` 任务队列并发） |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 
 ---

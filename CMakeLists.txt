@@ -24,6 +24,8 @@ endif()
 
 option(SPANIO_BUILD_TESTS "Build the SpanIO unit tests" ${SPANIO_IS_TOP_LEVEL})
 option(SPANIO_BUILD_EXAMPLES "Build the SpanIO example programs" ${SPANIO_IS_TOP_LEVEL})
+# Off by default: the benchmark is built on request, in Release
+option(SPANIO_BUILD_BENCHMARKS "Build the SpanIO benchmark program" OFF)
 
 # Feature switches. Each maps to the macro of the same name and is off by
 # default to keep the core small. Options for SSL, io_uring and coroutines
@@ -70,6 +72,10 @@ endif()
 
 if(SPANIO_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(SPANIO_BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
 endif()
 
 # ----------------------------------------------------------------------------

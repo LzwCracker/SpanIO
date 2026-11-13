@@ -28,6 +28,7 @@ set(SPANIO_TEST_NAMES
     test_api
     test_client_examples
     test_guide
+    test_benchmark
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
@@ -48,3 +49,10 @@ add_test(NAME guide_snippets_match
         -DGUIDE=${CMAKE_CURRENT_SOURCE_DIR}/../docs/guide.md
         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/test_guide.cpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_guide_snippets.cmake)
+
+# test_benchmark runs benchmark/compare.cmake: give it CMake, the script and
+# a directory for its scratch files
+target_compile_definitions(test_benchmark PRIVATE
+    SPANIO_CMAKE_COMMAND="${CMAKE_COMMAND}"
+    SPANIO_COMPARE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/../benchmark/compare.cmake"
+    SPANIO_TEST_WORK_DIR="${CMAKE_CURRENT_BINARY_DIR}")
