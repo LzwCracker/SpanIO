@@ -1,7 +1,15 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.21（设计草案，按 M1 实现修订；库版本 0.3.0）
+> 版本：v0.22（设计草案，按 M1 实现修订；库版本 0.3.1）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.22 修订记录（2026-11-15）**：M4 性能优化完成，库版本 0.3.1。
+> - **M4-A（原子 work count）**：`io_context::m_outstanding_work` 改为 `std::atomic<std::size_t>`，`work_finished()` 原子递减并用 acquire-release 语义，仅在归零时加锁；`work_started()` / `post_op()` / `start_io()` / `schedule_timer()` 改为原子递增。热路径从 3 次 mutex 加锁降到 2 次。新增 5 个测试用例（cases 16-20）验证原子计数在异常、线程、退出等场景下的正确性。**效果**：`post_rate` 4 线程 +41%（1.78 M/s → 2.52 M/s），单线程 +7%（9.48 M/s → 10.17 M/s）。
+> - **M4-B（线程本地队列）**：每个 `run()` 线程持有 `thread_local op_queue`，`context_frame` 扩展加上 `m_local_queue` 指针；`post_op()` 检查调用线程是否在 `run()` 中，是则无锁 push 到本地队列，否则加锁 push 到共享队列；`do_run_one()` 优先级：定时器（防止饿死）→ 共享队列（定时器 + 外部 post）→ 本地队列；`run()` 退出时 flush 本地队列到共享队列。热路径（post → 同线程执行）完全无锁，只有原子 work count 操作。**效果**：`post_rate` 4 线程 +386% vs M4-A（12.24 M/s），+588% vs 0.3.0（1.78 M/s）；`strand_rate` 4 线程 +113% vs M4-A（4.82 M/s），+215% vs 0.3.0（1.53 M/s）；单线程 +20% vs M4-A（12.25 M/s），+29% vs 0.3.0（9.48 M/s）；4 线程扩展性完美（0% 损失，基线 81%）。
+> - **M4-C（操作节点内存池）**：新增 `include/spanio/detail/op_pool.h`，`thread_local op_pool` 按大小分桶（16/32/64/128/256 字节）为单链表 free list；`make_handler_op()` / `make_io_op()` 改为用 placement new 从 pool 分配，`handler_op::do_complete()` / `io_op::do_complete()` 析构对象后归还节点到 pool（而不是 `delete`）；超大节点回退到 `operator new`；pool 在线程退出时释放所有块。消除每次异步操作的 `new` / `delete` 开销。**效果**：`post_rate` 4 线程 +94% vs M4-B（23.68 M/s），+1230% vs 0.3.0（1.78 M/s，**13.3 倍**）；`strand_rate` 4 线程 +59% vs M4-B（7.68 M/s），+402% vs 0.3.0（1.53 M/s，**5 倍**）；单线程 +93% vs M4-B（23.65 M/s），+149% vs 0.3.0（9.48 M/s，**2.5 倍**）。
+> - **总提升**（0.3.0 → 0.3.1）：`post_rate` 4 线程从 1.78 M/s 提升到 23.68 M/s（+1230%），单线程从 9.48 M/s 到 23.65 M/s（+149%）；`strand_rate` 4 线程从 1.53 M/s 到 7.68 M/s（+402%）。
+> - 发布 tag v0.3.1，GitHub Release 包含完整性能数据与技术细节。
+> - 十 / 十二：M4 标为完成。
 >
 > **v0.21 修订记录（2026-11-13）**：M4 基准测试。
 > - 新增 `benchmark/`：基准程序 `bench_spanio`（8 个场景，CMake 选项 `SPANIO_BUILD_BENCHMARKS`，默认关闭）、结果对比脚本 `compare.cmake`、0.3.0 基线 `benchmark/results/`；新增测试 `tests/test_benchmark.cpp`。
@@ -1073,6 +1081,7 @@ spanio/
 │           ├── reactor_proactor.h  # 在 io_reactor 上模拟 Proactor 的适配器（已实现）
 │           ├── platform_proactor.h # 按平台与配置选择默认 proactor（已实现）
 │           ├── scheduler_op.h      # io_context 任务节点与侵入式队列（已实现）
+│           ├── op_pool.h           # 操作节点内存池，按大小分桶的线程本地 free list（已实现，M4-C）
 │           ├── io_uring_reactor.h  # Linux io_uring 后端
 │           └── select_reactor.h    # Linux&Windows 通用后端
 │    
@@ -1204,7 +1213,7 @@ v0.6 验证情况：
 | M1 骨架   | 打通 io_context + epoll/iocp 双后端 + tcp::socket 读写 | echo_server 双平台可运行（**已完成**：Windows 与 Linux 上代码与测试全部通过，见 11.3） |
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
-| M4 性能   | 内存池、无锁发送队列、栈上缓冲                                 | 基准测试报告（进行中：基准程序与 0.3.0 基线已完成，见 `docs/benchmark.md`；下一步优化 `io_context` 任务队列并发） |
+| M4 性能   | 原子 work count、线程本地队列、内存池                                 | 基准测试报告（**已完成**：优化 `io_context` 任务队列并发（M4-A 原子 work count、M4-B 线程本地队列）与操作节点分配（M4-C 内存池），`post_rate` 4 线程从 1.78 M/s 提升到 23.68 M/s（+1230%），见 `docs/benchmark.md` 与 v0.3.1 Release） |
 | M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
 
 ---
