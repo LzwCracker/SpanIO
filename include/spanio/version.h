@@ -10,7 +10,7 @@
 //               #endif
 //               std::puts(SPANIO_VERSION_STRING);
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-10
+// Date:         2026-11-10; updated 2026-11-15 (0.3.1: M4 performance)
 // ============================================================================
 
 #ifndef SPANIO_VERSION_H
@@ -23,7 +23,7 @@
 #define SPANIO_VERSION_MINOR 3
 
 // Patch version: raised by fixes that change no interface
-#define SPANIO_VERSION_PATCH 0
+#define SPANIO_VERSION_PATCH 1
 
 // Weight of the major version in SPANIO_MAKE_VERSION
 #define SPANIO_VERSION_MAJOR_FACTOR 10000
@@ -39,6 +39,6 @@
 #define SPANIO_VERSION SPANIO_MAKE_VERSION(SPANIO_VERSION_MAJOR, SPANIO_VERSION_MINOR, SPANIO_VERSION_PATCH)
 
 // This version as text
-#define SPANIO_VERSION_STRING "0.3.0"
+#define SPANIO_VERSION_STRING "0.3.1"
 
 #endif // SPANIO_VERSION_H
