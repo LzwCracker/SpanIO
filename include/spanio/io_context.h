@@ -30,7 +30,7 @@
 //                 from the proactor. Those operations must already be
 //                 cancelled (unregister or cancel their sockets first).
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-04; updated 2026-11-14 (M4-A: atomic work count)
+// Date:         2026-11-04; updated 2026-11-14 (M4-A: atomic work count, M4-B: thread-local queue)
 // ============================================================================
 
 #ifndef SPANIO_IO_CONTEXT_H
@@ -79,13 +79,18 @@ constexpr int kContextNoWait = 0;
 // One entry of the per-thread stack of contexts the thread is running.
 // It lets dispatch() and running_in_this_thread() find out whether the
 // calling thread is inside run() of a given context, even when run() calls
-// are nested.
+// are nested. It also exposes the thread's local task queue so post_op()
+// can push directly to it (lock-free) when called from a running thread.
 struct context_frame
 {
     // Context being run by this frame
     const io_context* m_context;
     // Enclosing frame of the same thread, or nullptr
     context_frame* m_previous;
+    // Thread-local queue for handlers posted from this thread while it runs
+    // the context; nullptr when the thread has no local queue (e.g. poll()
+    // without blocking, or nested frames)
+    op_queue* m_local_queue;
 };
 
 // Top of the calling thread's stack of running contexts
@@ -101,9 +106,11 @@ inline context_frame*& current_frame() noexcept
 class context_frame_scope
 {
 public:
-    // Parameter context: context the calling thread is about to run
-    explicit context_frame_scope(const io_context* context) noexcept
-        : m_frame{context, current_frame()}
+    // Parameter context:     context the calling thread is about to run
+    // Parameter local_queue: thread-local queue for lock-free post; nullptr
+    //                        when the thread should not use one
+    explicit context_frame_scope(const io_context* context, op_queue* local_queue = nullptr) noexcept
+        : m_frame{context, current_frame(), local_queue}
     {
         current_frame() = &m_frame;
     }
@@ -167,16 +174,21 @@ public:
         shutdown();
     }
 
-    // Run handlers until there is no more work or stop() is called
+    // Run handlers until there is no more work or stop() is called. Uses a
+    // thread-local queue to minimize lock contention on the shared queue.
     // Return value: number of handlers run by this call
     std::size_t run()
     {
-        detail::context_frame_scope scope(this);
+        thread_local detail::op_queue local_queue;
+        detail::context_frame_scope scope(this, &local_queue);
         std::size_t count = 0;
-        while (do_run_one(true) != 0)
+        while (do_run_one(&local_queue, true) != 0)
         {
             ++count;
         }
+        // Flush any remaining handlers in the local queue to the shared queue
+        // so other threads can run them
+        flush_local_queue(local_queue);
         return count;
     }
 
@@ -184,18 +196,22 @@ public:
     // Return value: 1 if a handler ran, otherwise 0
     std::size_t run_one()
     {
-        detail::context_frame_scope scope(this);
-        return do_run_one(true);
+        thread_local detail::op_queue local_queue;
+        detail::context_frame_scope scope(this, &local_queue);
+        const std::size_t result = do_run_one(&local_queue, true);
+        flush_local_queue(local_queue);
+        return result;
     }
 
     // Run every handler that is ready, without blocking. I/O operations that
-    // have already finished are collected first.
+    // have already finished are collected first. Does not use a local queue
+    // because poll() does not wait and thus completes quickly.
     // Return value: number of handlers run by this call
     std::size_t poll()
     {
         detail::context_frame_scope scope(this);
         std::size_t count = 0;
-        while (do_run_one(false) != 0)
+        while (do_run_one(nullptr, false) != 0)
         {
             ++count;
         }
@@ -207,7 +223,7 @@ public:
     std::size_t poll_one()
     {
         detail::context_frame_scope scope(this);
-        return do_run_one(false);
+        return do_run_one(nullptr, false);
     }
 
     // Make every run() / run_one() / poll() return as soon as possible;
@@ -445,14 +461,31 @@ private:
         }
     }
 
-    // Queue a task node and wake a thread to run it
+    // Queue a task node and wake a thread to run it. When called from a thread
+    // that is running this context with a local queue, the handler is pushed
+    // to the local queue without taking the mutex; otherwise it goes to the
+    // shared queue.
     // Parameter op: node from make_handler_op(); owned by the context now
     void post_op(detail::scheduler_op* op)
     {
-        // Increment work atomically before taking the lock; a concurrent
+        // Increment work atomically before queuing; a concurrent
         // work_finished() that observes 0 must not stop the context before
         // the new handler is counted.
         m_outstanding_work.fetch_add(1, std::memory_order_relaxed);
+
+        // Check if the calling thread is running this context with a local queue
+        for (detail::context_frame* frame = detail::current_frame(); frame != nullptr;
+             frame = frame->m_previous)
+        {
+            if (frame->m_context == this && frame->m_local_queue != nullptr)
+            {
+                // Hot path: lock-free push to the thread's local queue
+                frame->m_local_queue->push(op);
+                return;
+            }
+        }
+
+        // Cold path: not running this context, or no local queue; use shared queue
         std::lock_guard<std::mutex> lock(m_mutex);
         m_queue.push(op);
         if (m_idle_threads > 0)
@@ -494,6 +527,28 @@ private:
         }
     }
 
+    // Move any remaining handlers from a local queue to the shared queue so
+    // other threads can run them. Called when a thread exits run() or run_one().
+    // Parameter local: the thread's local queue
+    void flush_local_queue(detail::op_queue& local)
+    {
+        if (local.empty())
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_queue.splice(local);
+        // Wake threads to process the flushed handlers
+        if (m_idle_threads > 0)
+        {
+            m_cond.notify_all();
+        }
+        else
+        {
+            interrupt_poller_locked();
+        }
+    }
+
     // Queue the handlers of every timer that has expired. Caller holds
     // m_mutex.
     void take_due_timers_locked()
@@ -520,17 +575,24 @@ private:
         return m_timers.wait_ms(detail::timer_clock::now());
     }
 
-    // Run at most one handler
-    // Parameter block: true waits for a handler, false returns at once
+    // Run at most one handler. Checks timers first (they must not starve).
+    // If a timer expired, runs it (from the shared queue) before checking the
+    // local queue, so timers have priority over locally-posted handlers.
+    // Parameter local_queue: thread-local queue; checked after shared queue
+    // Parameter block:       true waits for a handler, false returns at once
     // Return value: 1 if a handler ran, otherwise 0
-    std::size_t do_run_one(bool block)
+    std::size_t do_run_one(detail::op_queue* local_queue, bool block)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         while (!m_stopped)
         {
             // Checked before every handler, so a steady stream of handlers
-            // cannot keep a timer from firing
+            // cannot keep a timer from firing. Expired timers are queued to
+            // m_queue (the shared queue).
             take_due_timers_locked();
+
+            // If the shared queue has anything (timer or external post), run it
+            // before the local queue so timers cannot starve
             if (!m_queue.empty())
             {
                 detail::scheduler_op* op = m_queue.pop();
@@ -546,6 +608,18 @@ private:
                 op->complete(true);
                 return 1;
             }
+
+            // Shared queue is empty; check the local queue (still holding the lock
+            // to avoid a race with a concurrent post to the shared queue)
+            if (local_queue != nullptr && !local_queue->empty())
+            {
+                detail::scheduler_op* op = local_queue->pop();
+                lock.unlock();
+                work_finished_on_exit finished(*this);
+                op->complete(true);
+                return 1;
+            }
+
             if (m_outstanding_work.load(std::memory_order_relaxed) == 0)
             {
                 stop_locked();
