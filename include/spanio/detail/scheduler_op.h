@@ -14,13 +14,14 @@
 //               complete(true) to run it or complete(false) to discard it,
 //               and either call frees the node.
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-04
+// Date:         2026-11-04; updated 2026-11-15 (M4-C: memory pool)
 // ============================================================================
 
 #ifndef SPANIO_DETAIL_SCHEDULER_OP_H
 #define SPANIO_DETAIL_SCHEDULER_OP_H
 
 #include "spanio/detail/io_proactor.h"
+#include "spanio/detail/op_pool.h"
 #include "spanio/detail/platform.h"
 #include "spanio/detail/socket_ops.h"
 
@@ -150,7 +151,8 @@ private:
     scheduler_op* m_back;
 };
 
-// Task node that calls a function object with no arguments
+// Task node that calls a function object with no arguments. Uses the
+// thread-local memory pool to avoid malloc/free overhead.
 template <typename Handler>
 class handler_op : public scheduler_op
 {
@@ -164,33 +166,40 @@ public:
     }
 
 private:
-    // Free the node, then call the handler if asked to. The node is freed
-    // first so a throwing handler leaks nothing.
+    // Deallocate the node back to the pool, then call the handler if asked to.
+    // The node is freed first so a throwing handler leaks nothing.
     // Parameter base:   this node
     // Parameter invoke: whether to call the handler
     static void do_complete(scheduler_op* base, bool invoke)
     {
-        std::unique_ptr<handler_op> self(static_cast<handler_op*>(base));
-        if (!invoke)
-        {
-            return;
-        }
+        handler_op* self = static_cast<handler_op*>(base);
         Handler handler(std::move(self->m_handler));
-        self.reset();
-        handler();
+        // Return the node to the pool before calling the handler
+        self->~handler_op();
+        thread_pool().deallocate(self, sizeof(handler_op));
+        if (invoke)
+        {
+            handler();
+        }
     }
 
     // Function object called when the node runs
     Handler m_handler;
 };
 
-// Allocate a task node for a function object
+// Allocate a task node for a function object from the thread-local pool
 // Parameter handler: function object taking no arguments
 // Return value: the new node, owned by the caller until handed over
 template <typename Handler>
 scheduler_op* make_handler_op(Handler&& handler)
 {
-    return new handler_op<typename std::decay<Handler>::type>(std::forward<Handler>(handler));
+    using handler_type = handler_op<typename std::decay<Handler>::type>;
+    void* mem = thread_pool().allocate(sizeof(handler_type));
+    if (mem == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+    return new (mem) handler_type(std::forward<Handler>(handler));
 }
 
 // Result of a finished I/O operation, as passed to its completion handler
@@ -223,7 +232,8 @@ protected:
     }
 };
 
-// I/O task node whose completion calls Handler with an io_result
+// I/O task node whose completion calls Handler with an io_result. Uses the
+// thread-local memory pool to avoid malloc/free overhead.
 template <typename Handler>
 class io_op : public io_op_base
 {
@@ -237,15 +247,21 @@ public:
     }
 
 private:
-    // Free the node, then call the handler with the result if asked to. A
-    // discarded accept closes the socket nobody will ever own.
+    // Deallocate the node back to the pool, then call the handler with the
+    // result if asked to. A discarded accept closes the socket nobody will
+    // ever own.
     // Parameter base:   this node
     // Parameter invoke: whether to call the handler
     static void do_complete(scheduler_op* base, bool invoke)
     {
-        std::unique_ptr<io_op> self(static_cast<io_op*>(base));
+        io_op* self = static_cast<io_op*>(base);
         const io_result result{self->m_ec, self->m_bytes, self->m_address, self->m_address_len,
                                self->m_accepted};
+        Handler handler(std::move(self->m_handler));
+        // Return the node to the pool before calling the handler (or
+        // discarding it)
+        self->~io_op();
+        thread_pool().deallocate(self, sizeof(io_op));
         if (!invoke)
         {
             if (result.m_accepted != kInvalidHandle)
@@ -254,8 +270,6 @@ private:
             }
             return;
         }
-        Handler handler(std::move(self->m_handler));
-        self.reset();
         handler(result);
     }
 
@@ -263,14 +277,20 @@ private:
     Handler m_handler;
 };
 
-// Allocate an I/O task node. Fill it with a prepare_*() helper, then give it
-// to io_context::start_io().
+// Allocate an I/O task node from the thread-local pool. Fill it with a
+// prepare_*() helper, then give it to io_context::start_io().
 // Parameter handler: function object taking (const io_result&)
 // Return value: the new node, owned by the caller until handed over
 template <typename Handler>
 io_op_base* make_io_op(Handler&& handler)
 {
-    return new io_op<typename std::decay<Handler>::type>(std::forward<Handler>(handler));
+    using io_type = io_op<typename std::decay<Handler>::type>;
+    void* mem = thread_pool().allocate(sizeof(io_type));
+    if (mem == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+    return new (mem) io_type(std::forward<Handler>(handler));
 }
 
 }}

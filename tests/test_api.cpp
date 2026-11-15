@@ -236,10 +236,10 @@ SPANIO_TEST(umbrella_header)
 {
     static_assert(SPANIO_VERSION_MAJOR == 0, "major version");
     static_assert(SPANIO_VERSION_MINOR == 3, "minor version");
-    static_assert(SPANIO_VERSION_PATCH == 0, "patch version");
-    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 3, 0), "combined version");
-    static_assert(SPANIO_MAKE_VERSION(0, 3, 0) > SPANIO_MAKE_VERSION(0, 2, 9), "versions compare in order");
-    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.3.0") == 0);
+    static_assert(SPANIO_VERSION_PATCH == 1, "patch version");
+    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 3, 1), "combined version");
+    static_assert(SPANIO_MAKE_VERSION(0, 3, 1) > SPANIO_MAKE_VERSION(0, 3, 0), "versions compare in order");
+    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.3.1") == 0);
 
     // One type or function from every public header
     static_assert(std::is_class<spanio::io_context>::value, "io_context.h");
