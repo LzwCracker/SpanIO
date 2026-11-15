@@ -30,7 +30,7 @@
 //                 from the proactor. Those operations must already be
 //                 cancelled (unregister or cancel their sockets first).
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-04
+// Date:         2026-11-04; updated 2026-11-14 (M4-A: atomic work count)
 // ============================================================================
 
 #ifndef SPANIO_IO_CONTEXT_H
@@ -43,6 +43,7 @@
 #include "spanio/detail/scheduler_op.h"
 #include "spanio/detail/timer_queue.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -143,7 +144,7 @@ public:
     // Parameter proactor: backend the context takes ownership of
     explicit io_context(detail::io_proactor_ptr proactor)
         : m_proactor(std::move(proactor))
-        , m_outstanding_work(0)
+        , m_outstanding_work(0u)
         , m_outstanding_io(0)
         , m_idle_threads(0)
         , m_stopped(false)
@@ -321,7 +322,7 @@ private:
     {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_outstanding_work;
+            m_outstanding_work.fetch_add(1, std::memory_order_relaxed);
             ++m_outstanding_io;
         }
         m_proactor->start(op);
@@ -338,7 +339,7 @@ private:
                         detail::timer_wait_op* op)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_outstanding_work;
+        m_outstanding_work.fetch_add(1, std::memory_order_relaxed);
         if (m_timers.add(state, deadline, op))
         {
             // The thread polling is waiting for a later deadline, or for no
@@ -420,18 +421,27 @@ private:
     // Add one unit of work (used by executor_work_guard)
     void work_started()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_outstanding_work;
+        m_outstanding_work.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Remove one unit of work; stops the context when none is left
+    // Remove one unit of work; stops the context when none is left.
+    // The decrement is atomic so it does not need the mutex in the common
+    // case; only the rare "last work unit" path takes the lock to call
+    // stop_locked().
     void work_finished()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        --m_outstanding_work;
-        if (m_outstanding_work == 0)
+        // Acquire matches the release in work_started / post_op / start_io /
+        // schedule_timer so that the work additions they did are visible
+        // before we decide the context has no more work.
+        if (m_outstanding_work.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
-            stop_locked();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // Re-check inside the lock: another thread may have added work
+            // between our decrement and the lock acquisition.
+            if (m_outstanding_work.load(std::memory_order_relaxed) == 0)
+            {
+                stop_locked();
+            }
         }
     }
 
@@ -439,8 +449,11 @@ private:
     // Parameter op: node from make_handler_op(); owned by the context now
     void post_op(detail::scheduler_op* op)
     {
+        // Increment work atomically before taking the lock; a concurrent
+        // work_finished() that observes 0 must not stop the context before
+        // the new handler is counted.
+        m_outstanding_work.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_outstanding_work;
         m_queue.push(op);
         if (m_idle_threads > 0)
         {
@@ -533,7 +546,7 @@ private:
                 op->complete(true);
                 return 1;
             }
-            if (m_outstanding_work == 0)
+            if (m_outstanding_work.load(std::memory_order_relaxed) == 0)
             {
                 stop_locked();
                 return 0;
@@ -663,8 +676,9 @@ private:
     detail::op_queue m_queue;
     // Timers with pending waits; each wait counts as work
     detail::timer_queue m_timers;
-    // Queued handlers + started I/O operations + live work guards
-    std::size_t m_outstanding_work;
+    // Queued handlers + started I/O operations + live work guards; atomic so
+    // work_finished() avoids the mutex in the common (non-zero) case
+    std::atomic<std::size_t> m_outstanding_work;
     // Started I/O operations the proactor has not returned yet
     std::size_t m_outstanding_io;
     // Threads waiting on m_cond

@@ -14,7 +14,7 @@
 //               context, so the context (and its proactor) is destroyed
 //               first and the sockets are closed afterwards.
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-04
+// Date:         2026-11-04; updated 2026-11-14 (cases 16-20: work count)
 // ============================================================================
 
 #include "spanio/io_context.h"
@@ -79,6 +79,12 @@ constexpr long kDestroyedHandlers = 2;
 
 // Owners of the shared token in the destructor cases besides the test itself
 constexpr long kSoleOwner = 1;
+
+// Handlers posted per thread in the work_count_exact test
+constexpr int kExactCountPerThread = 5000;
+
+// Threads posting in the work_count_exact test
+constexpr int kExactCountThreads = 4;
 
 // Delay before a helper thread acts, so the main thread is surely blocked
 constexpr int kHelperDelayMs = 200;
@@ -626,6 +632,184 @@ SPANIO_TEST(destructor_drains_canceled_io)
         SPANIO_CHECK(token.use_count() == kSoleOwner);
         SPANIO_CHECK(!called);
     }
+}
+
+// Case 16: handlers posted from inside run() (from within another handler)
+// all execute in FIFO order, and the context stops normally afterwards.
+// This exercises the path where work_finished() observes exactly 0 after a
+// self-posting chain ends.
+SPANIO_TEST(local_queue_runs_handlers)
+{
+    io_context ctx;
+    std::vector<int> order;
+    // Each handler posts the next one; the final one does nothing more.
+    // Total depth: kChainLength posts from inside run().
+    std::function<void(int)> step = [&](int n)
+    {
+        order.push_back(n);
+        if (n + 1 < kChainLength)
+        {
+            auto next = [&step, n]()
+            {
+                step(n + 1);
+            };
+            ctx.post(next);
+        }
+    };
+    auto first = [&step]()
+    {
+        step(0);
+    };
+    ctx.post(first);
+    ctx.run();
+    SPANIO_REQUIRE(static_cast<int>(order.size()) == kChainLength);
+    for (int i = 0; i < kChainLength; ++i)
+    {
+        SPANIO_CHECK(order[static_cast<std::size_t>(i)] == i);
+    }
+    SPANIO_CHECK(ctx.stopped());
+}
+
+// Case 17: when stop() is called while handlers are still queued, those
+// handlers survive in the queue; restart() + run() delivers them all without
+// losing any.
+SPANIO_TEST(local_queue_exit_flushes)
+{
+    io_context ctx;
+    int executed = 0;
+    auto count_one = [&executed]()
+    {
+        ++executed;
+    };
+    // Post kOrderCount handlers, then stop before they all run
+    for (int i = 0; i < kOrderCount; ++i)
+    {
+        ctx.post(count_one);
+    }
+    // run_one() executes one, then we stop; the rest stay queued
+    ctx.run_one();
+    ctx.stop();
+    SPANIO_CHECK(ctx.stopped());
+    SPANIO_CHECK(executed == 1);
+    ctx.restart();
+    // run() must deliver every remaining handler exactly once
+    ctx.run();
+    SPANIO_CHECK(executed == kOrderCount);
+    SPANIO_CHECK(ctx.stopped());
+}
+
+// Case 18: an exception thrown by a handler propagates out of run(), but the
+// work count stays correct so a subsequent run() can continue and finish.
+SPANIO_TEST(local_queue_exception_safe)
+{
+    io_context ctx;
+    int after_throw = 0;
+    auto thrower = []()
+    {
+        throw std::runtime_error("test exception");
+    };
+    auto survivor = [&after_throw]()
+    {
+        ++after_throw;
+    };
+    ctx.post(thrower);
+    // Post a second handler that must still run after the exception
+    ctx.post(survivor);
+    bool caught = false;
+    try
+    {
+        ctx.run();
+    }
+    catch (const std::runtime_error&)
+    {
+        caught = true;
+    }
+    SPANIO_CHECK(caught);
+    SPANIO_CHECK(!ctx.stopped());
+    // The second handler is still queued; run() should process it and stop
+    ctx.run();
+    SPANIO_CHECK(after_throw == 1);
+    SPANIO_CHECK(ctx.stopped());
+}
+
+// Case 19: a post() from a thread that is not inside run() (the external
+// path, via the shared queue) is still delivered correctly and the context
+// stops after all handlers finish.
+SPANIO_TEST(local_queue_cross_thread_post)
+{
+    io_context ctx;
+    std::atomic<int> count{0};
+    // Post from a background thread before run() starts; all handlers land
+    // in the shared queue, then run() processes every one
+    auto count_one = [&count]()
+    {
+        count.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto post_all = [&ctx, &count_one]()
+    {
+        for (int i = 0; i < kHandlersPerPoster; ++i)
+        {
+            ctx.post(count_one);
+        }
+    };
+    std::thread poster(post_all);
+    poster.join();
+    // All handlers were queued by a thread that is not running the context;
+    // run() now processes them and stops when work reaches 0
+    ctx.run();
+    SPANIO_CHECK(count.load() == kHandlersPerPoster);
+    SPANIO_CHECK(ctx.stopped());
+}
+
+// Case 20: post N handlers from several threads concurrently; every handler
+// runs exactly once and the work count returns to zero so the context stops
+// on its own. This is a stress test for the atomic work count under
+// concurrent finish() calls.
+SPANIO_TEST(local_queue_work_count_exact)
+{
+    io_context ctx;
+    std::atomic<int> executed{0};
+    const int total = kExactCountPerThread * kExactCountThreads;
+    // Keep the context alive until all posters finish
+    auto guard = make_work_guard(ctx);
+    auto count_one = [&executed]()
+    {
+        executed.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto post_all = [&ctx, &count_one]()
+    {
+        for (int i = 0; i < kExactCountPerThread; ++i)
+        {
+            ctx.post(count_one);
+        }
+    };
+    auto run_context = [&ctx]()
+    {
+        ctx.run();
+    };
+    std::vector<std::thread> posters;
+    for (int t = 0; t < kExactCountThreads; ++t)
+    {
+        posters.emplace_back(post_all);
+    }
+    // Run with as many threads as posters to race post and finish
+    std::vector<std::thread> runners;
+    for (int t = 0; t < kExactCountThreads; ++t)
+    {
+        runners.emplace_back(run_context);
+    }
+    for (std::thread& th : posters)
+    {
+        th.join();
+    }
+    // All handlers are posted; release the guard so run() can finish
+    guard.reset();
+    for (std::thread& th : runners)
+    {
+        th.join();
+    }
+    SPANIO_CHECK(executed.load() == total);
+    SPANIO_CHECK(ctx.stopped());
 }
 
 int main(int argc, char** argv)
