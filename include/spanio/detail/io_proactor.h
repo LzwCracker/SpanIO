@@ -42,6 +42,11 @@
 #include "spanio/detail/platform.h"
 #include "spanio/detail/socket_ops.h"
 
+#if defined(SPANIO_PLATFORM_LINUX) && defined(SPANIO_ENABLE_IO_URING)
+// iovec, for the datagram message header of the io_uring backend
+#include <sys/uio.h>
+#endif
+
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -119,6 +124,13 @@ struct io_operation
 #if defined(SPANIO_PLATFORM_WINDOWS)
     // iocp_proactor: address buffer AcceptEx writes into
     char m_accept_buffer[kAcceptExBufferSize];
+#endif
+#if defined(SPANIO_PLATFORM_LINUX) && defined(SPANIO_ENABLE_IO_URING)
+    // io_uring_proactor: message header of kRecvFrom / kSendTo, read (and
+    // for receives written back) by the kernel until the operation returns
+    msghdr m_message;
+    // io_uring_proactor: the single buffer m_message points at
+    iovec m_iovec;
 #endif
 };
 

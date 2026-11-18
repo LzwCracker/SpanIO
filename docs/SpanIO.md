@@ -1,7 +1,16 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.22（设计草案，按 M1 实现修订；库版本 0.3.1）
+> 版本：v0.23（设计草案，按 M1 实现修订；库版本 0.3.1）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.23 修订记录（2026-11-18）**：M5 第一项，io_uring 后端。
+> - 新增 `include/spanio/detail/io_uring_proactor.h`：直接实现 `io_proactor`（不是 reactor），用原始系统调用 `io_uring_setup` / `io_uring_enter` 和 `mmap` 建立 SQ/CQ 双环，**不依赖 liburing**，保持零第三方依赖。CMake 选项 `SPANIO_ENABLE_IO_URING`（默认关闭）。
+> - 内核要求：`IORING_FEAT_NODROP`（5.5，CQ 满时不丢完成事件）与 `IORING_FEAT_EXT_ARG`（5.11，`poll()` 直接带超时等待），即 **Linux 5.11+**；不满足、或 `io_uring_setup` 被禁止（容器 seccomp、`kernel.io_uring_disabled`）时，`make_platform_proactor()` 运行期降级到 epoll（`make_preferred_proactor`）。
+> - 实现要点：每个 `start()` 写一个 SQE 并立即提交；`post()` 与立即失败走就绪表，用一个 NOP SQE 唤醒 `poll()`；`cancel()` / `unregister_handle()` 对每个未完成操作提交 `IORING_OP_ASYNC_CANCEL`，返回时内核已完成取消，可以立即关闭 socket；数据报用 `RECVMSG` / `SENDMSG`，截断由 `MSG_TRUNC` 报告为 `errc::message_size`；注册的 socket 切换为阻塞模式（部分 5.x 内核对 `O_NONBLOCK` socket 直接返回 `-EAGAIN`）。
+> - 实测（Ubuntu 24.04，内核 6.8）：**关闭一个 io_uring 实例时，内核会向每个用过它的线程投递 `TWA_SIGNAL` task_work，该线程下一次可中断的阻塞调用（`epoll_wait`、带超时的 `recv`）立即返回 `EINTR`**，即使该线程从未调用 `io_uring_enter`。因此 `epoll_reactor::poll()` 与 io_uring 的等待在 `EINTR` 时按剩余时间继续等待（`detail::wait_deadline`），不再提前返回；测试辅助函数改用重试 `EINTR` 的 `recv_retry` 等。用户程序在销毁使用 io_uring 的 `io_context` 后，自己的阻塞调用也可能遇到一次 `EINTR`。
+> - 6.9：`tcp::async_connect` 在某次尝试失败、但 socket 已被用户关闭时同样报告 `operation_canceled` 并停止（io_uring 在提交时就完成了回环地址上被拒绝的连接，取消来不及生效，之前会重新打开 socket 尝试下一个地址）。
+> - 新增测试 `tests/test_io_uring_proactor.cpp`（8 个用例）；`test_proactor_backends.h` 在可用时把 io_uring 加入后端列表，所有按后端循环的测试（`test_io_proactor`、`test_tcp`、`test_udp`、服务器测试等）都对 io_uring 运行。
+> - 十 / 十二 / 十三：同步工程结构、M5 进度和风险表。
 >
 > **v0.22 修订记录（2026-11-15）**：M4 性能优化完成，库版本 0.3.1。
 > - **M4-A（原子 work count）**：`io_context::m_outstanding_work` 改为 `std::atomic<std::size_t>`，`work_finished()` 原子递减并用 acquire-release 语义，仅在归零时加锁；`work_started()` / `post_op()` / `start_io()` / `schedule_timer()` 改为原子递增。热路径从 3 次 mutex 加锁降到 2 次。新增 5 个测试用例（cases 16-20）验证原子计数在异常、线程、退出等场景下的正确性。**效果**：`post_rate` 4 线程 +41%（1.78 M/s → 2.52 M/s），单线程 +7%（9.48 M/s → 10.17 M/s）。
@@ -268,7 +277,7 @@ io_reactor_ptr make_platform_reactor(std::error_code& ec);
   - `interrupt()` 通过 `PostQueuedCompletionStatus` 投递唤醒包实现。
   - `IOCTL_AFD_POLL` 属于**未公开的 Windows 内部接口**，风险见第十三节。
 
-- **`io_uring_reactor`（Linux 可选增强，计划 M5）**：基于 `io_uring` 的提交队列（SQ）与完成队列（CQ）双环结构，实现真正的异步提交—完成语义，减少系统调用次数。
+- **`io_uring_proactor`（Linux 可选增强，M5，已实现）**：基于 `io_uring` 的提交队列（SQ）与完成队列（CQ）双环结构，实现真正的异步提交—完成语义。它直接实现 `io_proactor`（不经过 `io_reactor`），用原始系统调用建立双环、不依赖 liburing；需 Linux 5.11+，不可用时运行期降级到 epoll。细节见 v0.23 修订记录。
 
 - **`select_reactor`（Windows & Linux，计划中）**：基于两个平台都提供的 POSIX 标准接口 `select`。
 
@@ -1082,7 +1091,7 @@ spanio/
 │           ├── platform_proactor.h # 按平台与配置选择默认 proactor（已实现）
 │           ├── scheduler_op.h      # io_context 任务节点与侵入式队列（已实现）
 │           ├── op_pool.h           # 操作节点内存池，按大小分桶的线程本地 free list（已实现，M4-C）
-│           ├── io_uring_reactor.h  # Linux io_uring 后端
+│           ├── io_uring_proactor.h # Linux io_uring Proactor，原始系统调用，可选（已实现，M5）
 │           └── select_reactor.h    # Linux&Windows 通用后端
 │    
 ├── examples/
@@ -1110,6 +1119,7 @@ spanio/
 │   ├── test_client_examples.cpp # 两个客户端示例的测试（已实现）
 │   ├── test_guide.cpp          # 使用指南中每段代码的编译与运行（已实现）
 │   ├── test_benchmark.cpp      # 基准程序自身的测试（已实现）
+│   ├── test_io_uring_proactor.cpp # io_uring 后端专有路径与运行期降级的测试（已实现，M5）
 │   ├── check_guide_snippets.cmake # 比对指南代码块与 test_guide.cpp（CTest：guide_snippets_match）（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
@@ -1131,7 +1141,7 @@ spanio/
 
 - C++17 起（协程模块需 C++20）。
 - CMake ≥ 3.15，通过 `if(WIN32)` / `if(UNIX)` 选择后端源文件与链接库。
-- Windows 需链接 `ws2_32.lib`；Linux 无需额外链接（io_uring 后端链接 `liburing`，可选）。
+- Windows 需链接 `ws2_32.lib`；Linux 无需额外链接（io_uring 后端直接使用系统调用，同样无需额外链接；编译需要 5.11+ 的内核头文件 `<linux/io_uring.h>`，更旧的头文件下后端不参与编译，工厂函数返回 `function_not_supported`）。
 
 ---
 
@@ -1214,7 +1224,7 @@ v0.6 验证情况：
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
 | M4 性能   | 原子 work count、线程本地队列、内存池                                 | 基准测试报告（**已完成**：优化 `io_context` 任务队列并发（M4-A 原子 work count、M4-B 线程本地队列）与操作节点分配（M4-C 内存池），`post_rate` 4 线程从 1.78 M/s 提升到 23.68 M/s（+1230%），见 `docs/benchmark.md` 与 v0.3.1 Release） |
-| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐            |
+| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐（**进行中**：io_uring 后端已完成，见 v0.23；TLS 与协程待开发） |
 
 ---
 
@@ -1226,7 +1236,7 @@ v0.6 验证情况：
 | AFD_POLL 为未公开接口   | 可选的 Windows AFD 路径依赖 `IOCTL_AFD_POLL` 等未公开的内核接口，微软未承诺兼容 | v0.3 起 Windows 默认使用只依赖公开 API 的原生 IOCP，AFD 路径仅在显式启用时使用；该接口自 Vista 起保持稳定，并被 libuv、mio、wepoll 长期使用；ntdll 函数在运行期查找，缺失时 `create()` 返回 `function_not_supported` 而不是崩溃 |
 | 水平触发的重复通知        | 持续就绪但暂不处理的 socket 每次 `poll()` 都会被报告 | 适配器在 socket 没有挂起操作时把它从 reactor 注销；必要时为 epoll 增加可选 ET 模式 |
 | 两个 Windows 后端行为差异 | 原生 IOCP 与 AFD 模拟在边界情况（错误码、部分发送）上可能不同 | 同一套 `test_io_proactor` 用例对两个后端都运行，约定见 4.4 |
-| io_uring 兼容性      | 需 Linux 5.1+ 内核与 liburing | 设为编译期可选，默认关闭，运行期探测降级               |
+| io_uring 兼容性      | 需 Linux 5.11+ 内核（NODROP、EXT_ARG）；容器可能禁止 io_uring；关闭实例会让用过它的线程收到一次 `EINTR` | 设为编译期可选，默认关闭；不依赖 liburing；运行期探测降级到 epoll；库内阻塞等待在 `EINTR` 时按剩余时间继续 |
 | 协程依赖 C++20        | 提高编译器门槛                   | 协程作为可选模块，不影响核心使用                   |
 | 头文件编译膨胀           | header-only 可能拖慢编译        | 提供分离编译模式；模板尽量外提，减少实例化              |
 | 与 Asio 生态重叠       | 用户可能倾向成熟方案                | 主打轻量 + 易用 + 零依赖的差异化，避免正面功能对标       |

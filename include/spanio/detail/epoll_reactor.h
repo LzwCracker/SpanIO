@@ -115,16 +115,24 @@ public:
     {
         out.clear();
         epoll_event events[kMaxEventsPerPoll];
-        const int count = ::epoll_wait(m_epoll_fd, events,
-                                       static_cast<int>(kMaxEventsPerPoll), timeout_ms);
-        if (count == kSocketCallFailed)
+        const wait_deadline deadline(timeout_ms);
+        int count = kSocketCallFailed;
+        for (;;)
         {
+            count = ::epoll_wait(m_epoll_fd, events, static_cast<int>(kMaxEventsPerPoll),
+                                 deadline.remaining_ms());
+            if (count != kSocketCallFailed)
+            {
+                break;
+            }
             const std::error_code wait_ec = last_error();
-            // A signal handler ran; report "no events" and let the caller loop
+            // EINTR does not only come from signal handlers: closing an
+            // io_uring instance queues a TWA_SIGNAL task_work on every thread
+            // that used it, which interrupts the next wait. Keep waiting for
+            // the rest of the timeout, so poll() never returns early.
             if (wait_ec.value() == EINTR)
             {
-                ec.clear();
-                return 0;
+                continue;
             }
             ec = wait_ec;
             log_error("epoll_wait", ec);

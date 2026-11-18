@@ -240,7 +240,7 @@ bool sees_close(native_handle_t handle)
 {
     const test_clock::time_point start = test_clock::now();
     char byte = 0;
-    const int result = ::recv(handle, &byte, 1, spanio::test::kNoSocketFlags);
+    const int result = spanio::test::recv_retry(handle, &byte, 1, spanio::test::kNoSocketFlags);
     return result <= spanio::test::kSocketClosedResult && elapsed_ms(start) < kWaitLimitMs;
 }
 
@@ -253,7 +253,7 @@ bool recv_until_closed(native_handle_t handle, std::string& out)
     std::vector<char> chunk(kOverflowChunk);
     while (true)
     {
-        const int result = ::recv(handle, chunk.data(), static_cast<int>(chunk.size()),
+        const int result = spanio::test::recv_retry(handle, chunk.data(), static_cast<int>(chunk.size()),
                                   spanio::test::kNoSocketFlags);
         if (result == 0)
         {

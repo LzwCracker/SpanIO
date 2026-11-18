@@ -195,7 +195,7 @@ public:
     // Return value: true if all of them went out
     bool send(const udp::endpoint& peer, std::string_view data)
     {
-        const int result = ::sendto(m_socket.get(), data.data(), static_cast<int>(data.size()),
+        const int result = spanio::test::sendto_retry(m_socket.get(), data.data(), static_cast<int>(data.size()),
                                     spanio::test::kNoSocketFlags, peer.data(), peer.size());
         return result == static_cast<int>(data.size());
     }
@@ -209,7 +209,7 @@ public:
         std::vector<char> buffer(kClientBufferSize);
         sockaddr_storage from{};
         spanio::detail::socklen_type length = static_cast<spanio::detail::socklen_type>(sizeof(from));
-        const int result = ::recvfrom(m_socket.get(), buffer.data(), static_cast<int>(buffer.size()),
+        const int result = spanio::test::recvfrom_retry(m_socket.get(), buffer.data(), static_cast<int>(buffer.size()),
                                       spanio::test::kNoSocketFlags, reinterpret_cast<sockaddr*>(&from),
                                       &length);
         if (result < 0)

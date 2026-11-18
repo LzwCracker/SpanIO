@@ -191,7 +191,7 @@ public:
                 return true;
             }
             char chunk[kClientChunkSize];
-            const int result = ::recv(m_socket.get(), chunk, static_cast<int>(sizeof(chunk)),
+            const int result = spanio::test::recv_retry(m_socket.get(), chunk, static_cast<int>(sizeof(chunk)),
                                       spanio::test::kNoSocketFlags);
             if (result <= spanio::test::kSocketClosedResult)
             {

@@ -337,6 +337,17 @@ SPANIO_TEST(proactor_create_destroy_and_default_backend)
     SPANIO_REQUIRE(default_proactor != nullptr);
 #if defined(SPANIO_PLATFORM_WINDOWS) && !defined(SPANIO_WINDOWS_USE_AFD_REACTOR)
     SPANIO_CHECK(std::strcmp(default_proactor->name(), "iocp-proactor") == 0);
+#elif defined(SPANIO_HAS_IO_URING)
+    // io_uring is preferred; epoll only when this kernel refuses io_uring
+    io_proactor_ptr probe = make_io_uring_proactor(ec);
+    if (probe != nullptr)
+    {
+        SPANIO_CHECK(std::strcmp(default_proactor->name(), "io-uring-proactor") == 0);
+    }
+    else
+    {
+        SPANIO_CHECK(is_adapter(*default_proactor));
+    }
 #else
     SPANIO_CHECK(is_adapter(*default_proactor));
 #endif
@@ -749,7 +760,8 @@ SPANIO_TEST(proactor_start_on_unregistered_socket_fails_through_poll)
         proactor->start(&recv_op);
         SPANIO_REQUIRE(wait_one(*proactor, recv_op, kCompleteWaitMs));
         SPANIO_CHECK(static_cast<bool>(recv_op.m_ec));
-        if (is_adapter(*proactor))
+        // Backends that track registrations reject the socket themselves
+        if (is_adapter(*proactor) || std::strcmp(proactor->name(), "io-uring-proactor") == 0)
         {
             SPANIO_CHECK(recv_op.m_ec == std::errc::bad_file_descriptor);
         }

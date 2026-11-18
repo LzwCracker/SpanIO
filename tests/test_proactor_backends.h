@@ -3,7 +3,8 @@
 //               shared by the tests that must cover all of them:
 //               - Windows: iocp_proactor (native) and reactor_proactor over
 //                 the IOCP + AFD poll reactor
-//               - Linux:   reactor_proactor over epoll
+//               - Linux:   reactor_proactor over epoll, plus io_uring_proactor
+//                 when SPANIO_ENABLE_IO_URING is on and the kernel allows it
 // Usage:        for (const backend_factory& backend : backends())
 //               {
 //                   announce(backend);
@@ -18,6 +19,7 @@
 #ifndef SPANIO_TESTS_TEST_PROACTOR_BACKENDS_H
 #define SPANIO_TESTS_TEST_PROACTOR_BACKENDS_H
 
+#include "spanio/detail/io_uring_proactor.h"
 #include "spanio/detail/platform_proactor.h"
 #include "spanio/io_context.h"
 #include "test_framework.h"
@@ -53,6 +55,17 @@ inline detail::io_proactor_ptr create_native_proactor(std::error_code& ec)
 }
 #endif
 
+#if defined(SPANIO_HAS_IO_URING)
+// Check once whether this kernel lets the process set up an io_uring
+// Return value: empty if it does, otherwise the reason it does not
+inline std::error_code probe_io_uring()
+{
+    std::error_code ec;
+    detail::io_proactor_ptr probe = detail::make_io_uring_proactor(ec);
+    return ec;
+}
+#endif
+
 // Every backend available on this platform
 // Return value: list of factories, never empty
 inline std::vector<backend_factory> backends()
@@ -63,6 +76,21 @@ inline std::vector<backend_factory> backends()
     list.push_back(backend_factory{"reactor-proactor over iocp-afd", &detail::make_reactor_proactor});
 #else
     list.push_back(backend_factory{"reactor-proactor over epoll", &detail::make_reactor_proactor});
+#if defined(SPANIO_HAS_IO_URING)
+    // Only listed when this kernel can set it up; otherwise the build still
+    // tests everything else and says why io_uring was skipped. Probed once
+    // per process: closing a ring interrupts the next blocking call of the
+    // thread with EINTR, which would disturb the case that follows.
+    static const std::error_code probe_result = probe_io_uring();
+    if (!probe_result)
+    {
+        list.push_back(backend_factory{"io-uring-proactor (native)", &detail::make_io_uring_proactor});
+    }
+    else
+    {
+        std::printf("    [io-uring-proactor skipped: %s]\n", probe_result.message().c_str());
+    }
+#endif
 #endif
     return list;
 }

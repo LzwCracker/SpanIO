@@ -28,9 +28,13 @@ option(SPANIO_BUILD_EXAMPLES "Build the SpanIO example programs" ${SPANIO_IS_TOP
 option(SPANIO_BUILD_BENCHMARKS "Build the SpanIO benchmark program" OFF)
 
 # Feature switches. Each maps to the macro of the same name and is off by
-# default to keep the core small. Options for SSL, io_uring and coroutines
-# will be added together with those modules.
+# default to keep the core small. Options for SSL and coroutines will be
+# added together with those modules.
 option(SPANIO_ENABLE_LOG "Enable the built-in lightweight logging" OFF)
+
+# Linux only: prefer the native io_uring proactor (raw system calls, no
+# liburing); falls back to epoll at run time when the kernel lacks io_uring
+option(SPANIO_ENABLE_IO_URING "Linux: use the io_uring backend when the kernel supports it" OFF)
 
 # Windows only: use the readiness emulation (reactor_proactor over the
 # IOCP + AFD poll reactor) instead of the native IOCP proactor
@@ -63,6 +67,12 @@ endif()
 
 if(SPANIO_WINDOWS_USE_AFD_REACTOR)
     target_compile_definitions(spanio INTERFACE SPANIO_WINDOWS_USE_AFD_REACTOR)
+endif()
+
+# The macro is harmless on Windows: every io_uring code path also checks
+# for Linux
+if(SPANIO_ENABLE_IO_URING)
+    target_compile_definitions(spanio INTERFACE SPANIO_ENABLE_IO_URING)
 endif()
 
 if(SPANIO_BUILD_TESTS)

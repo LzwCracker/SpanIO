@@ -13,6 +13,7 @@ set(SPANIO_TEST_NAMES
     test_socket_ops
     test_io_reactor
     test_io_proactor
+    test_io_uring_proactor
     test_io_context
     test_tcp
     test_echo_server

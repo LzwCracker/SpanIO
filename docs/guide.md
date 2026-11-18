@@ -104,6 +104,7 @@ int main()
 |---|---|
 | `SPANIO_ENABLE_LOG`（CMake 选项 `-DSPANIO_ENABLE_LOG=ON`） | 关键路径出错时向 stderr 打印日志，排查问题时打开 |
 | `SPANIO_WINDOWS_USE_AFD_REACTOR`（CMake 选项同名） | Windows 上不用原生 IOCP，改用就绪通知模拟（与 Linux 同一套代码路径），一般不需要 |
+| `SPANIO_ENABLE_IO_URING`（CMake 选项同名） | Linux 上优先使用 io_uring 后端（需内核 5.11+，不依赖 liburing）；内核不支持或被禁止时自动退回 epoll |
 
 ---
 
@@ -744,7 +745,7 @@ for (std::thread& thread : threads)
 | 平台 | 默认后端 | 说明 |
 |---|---|---|
 | Windows | 原生 IOCP（`AcceptEx` / `ConnectEx` / `WSARecv` / `WSASend`） | 定义 `SPANIO_WINDOWS_USE_AFD_REACTOR` 可改用就绪通知模拟 |
-| Linux | epoll（水平触发）+ 就绪后由库完成读写 | io_uring 后端计划在 M5 提供 |
+| Linux | epoll（水平触发）+ 就绪后由库完成读写 | 定义 `SPANIO_ENABLE_IO_URING` 后优先使用 io_uring（内核直接完成读写，后端名 `io-uring-proactor`），不可用时自动退回 epoll。注意：销毁使用 io_uring 的 `io_context` 后，用过它的线程的下一次阻塞调用可能返回一次 `EINTR`，这是内核行为 |
 
 `context.backend_name()` 返回当前后端的名字，可以打到启动日志里。
 

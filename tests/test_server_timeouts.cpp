@@ -178,7 +178,7 @@ bool read_until_closed(spanio::detail::native_handle_t handle, std::string& out)
     std::vector<char> chunk(kReadChunk);
     while (true)
     {
-        const int result = ::recv(handle, chunk.data(), static_cast<int>(chunk.size()),
+        const int result = spanio::test::recv_retry(handle, chunk.data(), static_cast<int>(chunk.size()),
                                   spanio::test::kNoSocketFlags);
         if (result == 0)
         {
@@ -561,7 +561,7 @@ public:
     bool receive(std::string& data)
     {
         char buffer[kDatagramBufferSize];
-        const int result = ::recv(m_socket.get(), buffer, static_cast<int>(sizeof(buffer)),
+        const int result = spanio::test::recv_retry(m_socket.get(), buffer, static_cast<int>(sizeof(buffer)),
                                   spanio::test::kNoSocketFlags);
         if (result < 0)
         {
@@ -680,7 +680,7 @@ SPANIO_TEST(sending_counts_as_activity)
         {
             std::vector<char> chunk(kReadChunk);
             while (reading.load()
-                   && ::recv(handle, chunk.data(), static_cast<int>(chunk.size()), spanio::test::kNoSocketFlags) > 0)
+                   && spanio::test::recv_retry(handle, chunk.data(), static_cast<int>(chunk.size()), spanio::test::kNoSocketFlags) > 0)
             {
             }
         };

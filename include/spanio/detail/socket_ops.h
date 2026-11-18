@@ -16,6 +16,7 @@
 
 #include "spanio/detail/platform.h"
 
+#include <chrono>
 #include <system_error>
 
 namespace spanio { namespace detail {
@@ -325,6 +326,47 @@ inline std::error_code configure_datagram_socket(native_handle_t handle) noexcep
 #endif
     return std::error_code();
 }
+
+// Deadline of a wait whose limit is given in milliseconds. A wait that was
+// interrupted (EINTR) is repeated with remaining_ms(), so the caller never
+// returns before its timeout because of the interruption.
+class wait_deadline
+{
+public:
+    // Start the clock
+    // Parameter timeout_ms: limit in milliseconds; negative waits without
+    //                       limit, 0 does not wait
+    explicit wait_deadline(int timeout_ms) noexcept
+        : m_timeout_ms(timeout_ms)
+        , m_end(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms))
+    {
+    }
+
+    // Time left, rounded up so a repeated wait never ends early
+    // Return value: -1 for an unlimited wait, otherwise milliseconds >= 0
+    int remaining_ms() const noexcept
+    {
+        if (m_timeout_ms < 0)
+        {
+            return -1;
+        }
+        const auto left = m_end - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero())
+        {
+            return 0;
+        }
+        // Round up: a wait truncated to whole milliseconds would end early
+        const auto rounded = std::chrono::duration_cast<std::chrono::milliseconds>(
+            left + std::chrono::milliseconds(1) - std::chrono::steady_clock::duration(1));
+        return static_cast<int>(rounded.count());
+    }
+
+private:
+    // Limit given to the constructor; negative means unlimited
+    int m_timeout_ms;
+    // Moment the limit expires (start time for unlimited waits, unused)
+    std::chrono::steady_clock::time_point m_end;
+};
 
 }}
 

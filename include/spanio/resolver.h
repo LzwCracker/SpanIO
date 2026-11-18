@@ -638,11 +638,16 @@ public:
             m_handler(ec, m_endpoints[m_index]);
             return;
         }
-        if (ec == std::errc::operation_canceled)
+        // The sequence only closes the socket right before the next attempt,
+        // so a closed socket here means the user closed it. The attempt may
+        // have failed on its own before the close could cancel it (io_uring
+        // completes a refused loopback connect inside the submission), which
+        // must still stop the sequence.
+        if (ec == std::errc::operation_canceled || !m_socket->is_open())
         {
             // The user cancelled or closed the socket: stop here instead of
             // reopening it for the next endpoint
-            m_handler(ec, tcp::endpoint());
+            m_handler(std::make_error_code(std::errc::operation_canceled), tcp::endpoint());
             return;
         }
         m_last_error = ec;

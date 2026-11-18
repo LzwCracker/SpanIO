@@ -40,6 +40,74 @@ constexpr int kNoSocketFlags = 0;
 // recv/send result at or below which the connection is closed or failed
 constexpr int kSocketClosedResult = 0;
 
+// Whether the last failed socket call was interrupted and should simply be
+// repeated. On Linux, closing an io_uring instance queues a TWA_SIGNAL
+// task_work on every thread that used it, which makes the thread's next
+// blocking call with a timeout fail with EINTR.
+// Return value: true for EINTR on Linux; always false on Windows
+inline bool interrupted_call()
+{
+#if defined(SPANIO_PLATFORM_LINUX)
+    return errno == EINTR;
+#else
+    return false;
+#endif
+}
+
+// ::recv, repeated while it is interrupted (see interrupted_call)
+// Parameters: as ::recv
+// Return value: as ::recv
+inline int recv_retry(detail::native_handle_t handle, char* data, int size, int flags)
+{
+    int result = detail::kSocketCallFailed;
+    do
+    {
+        result = static_cast<int>(::recv(handle, data, size, flags));
+    } while (result == detail::kSocketCallFailed && interrupted_call());
+    return result;
+}
+
+// ::send, repeated while it is interrupted (see interrupted_call)
+// Parameters: as ::send
+// Return value: as ::send
+inline int send_retry(detail::native_handle_t handle, const char* data, int size, int flags)
+{
+    int result = detail::kSocketCallFailed;
+    do
+    {
+        result = static_cast<int>(::send(handle, data, size, flags));
+    } while (result == detail::kSocketCallFailed && interrupted_call());
+    return result;
+}
+
+// ::recvfrom, repeated while it is interrupted (see interrupted_call)
+// Parameters: as ::recvfrom
+// Return value: as ::recvfrom
+inline int recvfrom_retry(detail::native_handle_t handle, char* data, int size, int flags, sockaddr* from,
+                          detail::socklen_type* length)
+{
+    int result = detail::kSocketCallFailed;
+    do
+    {
+        result = static_cast<int>(::recvfrom(handle, data, size, flags, from, length));
+    } while (result == detail::kSocketCallFailed && interrupted_call());
+    return result;
+}
+
+// ::sendto, repeated while it is interrupted (see interrupted_call)
+// Parameters: as ::sendto
+// Return value: as ::sendto
+inline int sendto_retry(detail::native_handle_t handle, const char* data, int size, int flags,
+                        const sockaddr* to, detail::socklen_type length)
+{
+    int result = detail::kSocketCallFailed;
+    do
+    {
+        result = static_cast<int>(::sendto(handle, data, size, flags, to, length));
+    } while (result == detail::kSocketCallFailed && interrupted_call());
+    return result;
+}
+
 // Owns a socket handle and closes it when the scope ends, so a failed
 // SPANIO_REQUIRE does not leak the handle
 class socket_guard
@@ -204,7 +272,7 @@ inline bool send_all(detail::native_handle_t handle, const char* data, std::size
     std::size_t sent = 0;
     while (sent < size)
     {
-        const int result = ::send(handle, data + sent, static_cast<int>(size - sent), kNoSocketFlags);
+        const int result = send_retry(handle, data + sent, static_cast<int>(size - sent), kNoSocketFlags);
         if (result <= kSocketClosedResult)
         {
             return false;
@@ -224,7 +292,7 @@ inline bool recv_exact(detail::native_handle_t handle, char* data, std::size_t s
     std::size_t received = 0;
     while (received < size)
     {
-        const int result = ::recv(handle, data + received, static_cast<int>(size - received),
+        const int result = recv_retry(handle, data + received, static_cast<int>(size - received),
                                   kNoSocketFlags);
         if (result <= kSocketClosedResult)
         {
