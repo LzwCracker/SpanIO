@@ -1,7 +1,17 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.23（设计草案，按 M1 实现修订；库版本 0.3.1）
+> 版本：v0.24（设计草案，按 M1 实现修订；库版本 0.4.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.24 修订记录（2026-11-19）**：M5 第二项，完成令牌与 C++20 协程；库版本 0.4.0。
+> - 新增 `include/spanio/async_result.h`（C++17）：`async_result<Token, Signature>`（主模板把令牌当作回调，`return_type` 为 `void`）、`async_return_t`、`async_initiate`；令牌 `use_future`（返回 `std::future<值>`）、`as_tuple(令牌)`（结果连同错误码打包成一个 `std::tuple` 交给内层令牌）、`detached`（丢弃结果）。"值"由签名决定：首参数为 `std::error_code` 时非空即抛 `std::system_error`，为 `std::exception_ptr` 时非空即重新抛出，其余参数无则 `void`、一个即其本身、多个为 `std::tuple`。
+> - 11 个异步接口（`tcp::socket` 5 个、`async_accept`、`udp::socket` 2 个、`async_wait`、`async_resolve`、`tcp::async_connect`）改为接受完成令牌：公开函数只构造一个发起对象（initiation）并调用 `async_initiate`，原来的函数体移到私有的 `start_*`。传回调时返回类型仍是 `void`、行为不变，属于 6.11 允许的兼容增加；各类新增 `*_signature` 类型别名。
+> - 新增 `include/spanio/coroutine.h`（C++20）：`awaitable<T>`（惰性启动，对称转移）、`use_awaitable`、`co_spawn(executor | io_context, awaitable, token)`（完成签名 `void(std::exception_ptr[, T])`，因此同样接受任意令牌）。CMake 选项 `SPANIO_ENABLE_COROUTINE` 定义同名宏并让 `spanio` 目标要求 C++20，`spanio/spanio.h` 据此包含协程头；未开启时整个库仍只需 C++17。
+> - 设计要点：一棵协程树（`co_spawn` 外层帧及其 `co_await` 的各层帧）共享一个类型擦除的执行器和"所有者"帧；每次挂起只有一个 `coro_resumer`，它若未运行就被销毁（`io_context` / strand 销毁），会销毁整棵树，挂起中的协程不泄漏。操作在 `await_suspend` 中发起，发起后不再访问等待对象（另一线程可能已恢复并结束该帧），发起对象先复制到栈上再调用。`co_spawn` 的完成回调通过执行器 `post`，抛出的异常像普通回调一样从 `run()` 传出。
+> - 实测缺陷与修复：多线程 + strand 下，协程恢复经 `strand::dispatch` 内联执行，若该协程随之结束，会销毁持有这份 strand 拷贝的执行器对象，而 `run_and_finish` 之后还要用它解锁，导致访问冲突（Windows 0xC0000005，5/5 复现）。改为通过执行器的局部拷贝来 dispatch / post 后 5/5 通过。
+> - 观察（未修改）：M4-B 线程本地队列下，strand 的下一个 invoker 被 post 到当前线程的本地队列，其他线程无法取走；该线程随后执行耗时回调时，strand 上的工作要等它，即使别的线程空闲。不影响正确性，但增加多线程下 strand 的延迟，留待后续评估。
+> - 新增示例 `examples/coro_echo_server.cpp`（C++20，`SPANIO_CORO_ECHO_SERVER_NO_MAIN` 模式）；新增测试 `tests/test_completion_tokens.cpp`（C++17，5 个用例）、`tests/test_coroutine.cpp`（C++20，9 个用例）；`test_api` 新增 2 个用例（回调仍返回 `void`、自定义令牌生效）；`test_guide` 改为 C++20 编译并新增 2 个用例；使用指南新增第 9 章"完成令牌与协程"。
+> - 6.3：补全多范式支持的实现说明。十 / 十二：同步工程结构和 M5 进度。
 >
 > **v0.23 修订记录（2026-11-18）**：M5 第一项，io_uring 后端。
 > - 新增 `include/spanio/detail/io_uring_proactor.h`：直接实现 `io_proactor`（不是 reactor），用原始系统调用 `io_uring_setup` / `io_uring_enter` 和 `mmap` 建立 SQ/CQ 双环，**不依赖 liburing**，保持零第三方依赖。CMake 选项 `SPANIO_ENABLE_IO_URING`（默认关闭）。
@@ -543,9 +553,16 @@ sock.async_read_some(spanio::buffer(buf), on_read);
 | -------------------- | ------------------------------------- | --------- |
 | 回调（Callback）         | 最基础，零额外依赖                             | 所有用户      |
 | Future / `awaitable` | 通过 `use_future` 等定制标记返回 `std::future` | 偏好同步风格的用户 |
-| 协程（可选）               | 检测到 `co_await` 时启用 C++20 协程适配         | 现代 C++ 用户 |
+| 协程（可选）               | `use_awaitable` 令牌返回 `awaitable<T>`，C++20 协程中 `co_await` | 现代 C++ 用户 |
 
 三者共享同一套底层完成事件，**只是完成令牌（CompletionToken）不同**，无需重复实现逻辑。
+
+**实现（v0.24，库版本 0.4.0）**：
+
+- `spanio/async_result.h`（C++17）：`async_result<Token, Signature>` 决定某个令牌的返回类型和发起方式；主模板把令牌当作回调。每个 `async_xxx(..., Token&& token)` 返回 `async_return_t<Token, Signature>`，内部调用 `async_initiate<Signature>(initiation, token)`；发起对象恰好被调用一次，参数是最终的回调。
+- 令牌：回调、`use_future`、`as_tuple(令牌)`、`detached`；`spanio/coroutine.h`（C++20）中的 `use_awaitable`。用户为自己的令牌特化 `async_result` 即可。
+- `co_spawn(executor, awaitable<T>, token)` 本身也是一个异步操作，完成签名为 `void(std::exception_ptr, T)`（`T` 为 `void` 时只有异常指针）。
+- 规则：回调从不内联执行（各令牌都一样）；协程在执行器上恢复（strand 上的协程不并发）；`io_context` 销毁时挂起中的协程树被整体销毁。
 
 ### 6.4 Strand：用户免加锁的串行化（v0.16 实现）
 
@@ -1063,8 +1080,10 @@ spanio/
 │       ├── spanio.h                # 总入口：包含全部公开头文件（已实现，用法 #include "spanio/spanio.h"）
 │       ├── io_context.h            # 执行引擎：事件循环、任务队列、executor、work guard（已实现）
 │       ├── executor.h              # 执行器抽象
+│       ├── async_result.h          # 完成令牌：async_result、use_future、as_tuple、detached（已实现，M5）
+│       ├── coroutine.h             # C++20 协程：awaitable、use_awaitable、co_spawn（已实现，M5）
 │       ├── strand.h                # 串行化域 strand、make_strand、bind_executor（已实现）
-│       ├── version.h               # 版本号宏 SPANIO_VERSION_*（已实现，0.3.0）
+│       ├── version.h               # 版本号宏 SPANIO_VERSION_*（已实现，当前 0.4.0）
 │       ├── error.h                 # SpanIO 自有错误码（error::misc_errors::eof）（已实现）
 │       ├── buffer.h                # 缓冲区抽象 mutable_buffer / const_buffer（已实现）
 │       ├── ip.h                    # ip::address、ipv4 / ipv6 常用地址（已实现）
@@ -1100,6 +1119,7 @@ spanio/
 │   ├── timer_demo.cpp          # 定时器示例（已实现）
 │   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 │   ├── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
+│   ├── coro_echo_server.cpp    # M5 示例：C++20 协程写的回显服务（已实现）
 │   ├── tcp_client.cpp          # TCP 客户端示例：异步解析、按地址列表连接、async_read、整体超时（已实现）
 │   └── udp_client.cpp          # UDP 客户端示例：同步解析、收发数据报、等待超时（已实现）
 ├── tests/
@@ -1120,6 +1140,8 @@ spanio/
 │   ├── test_guide.cpp          # 使用指南中每段代码的编译与运行（已实现）
 │   ├── test_benchmark.cpp      # 基准程序自身的测试（已实现）
 │   ├── test_io_uring_proactor.cpp # io_uring 后端专有路径与运行期降级的测试（已实现，M5）
+│   ├── test_completion_tokens.cpp # use_future / as_tuple / detached 测试（已实现，M5）
+│   ├── test_coroutine.cpp      # C++20 协程测试（已实现，M5）
 │   ├── check_guide_snippets.cmake # 比对指南代码块与 test_guide.cpp（CTest：guide_snippets_match）（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
@@ -1224,7 +1246,7 @@ v0.6 验证情况：
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
 | M4 性能   | 原子 work count、线程本地队列、内存池                                 | 基准测试报告（**已完成**：优化 `io_context` 任务队列并发（M4-A 原子 work count、M4-B 线程本地队列）与操作节点分配（M4-C 内存池），`post_rate` 4 线程从 1.78 M/s 提升到 23.68 M/s（+1230%），见 `docs/benchmark.md` 与 v0.3.1 Release） |
-| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐（**进行中**：io_uring 后端已完成，见 v0.23；TLS 与协程待开发） |
+| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐（**进行中**：io_uring 后端已完成，见 v0.23；完成令牌与 C++20 协程已完成，库版本 0.4.0，见 v0.24；TLS 待开发） |
 
 ---
 

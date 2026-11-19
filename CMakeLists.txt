@@ -28,13 +28,17 @@ option(SPANIO_BUILD_EXAMPLES "Build the SpanIO example programs" ${SPANIO_IS_TOP
 option(SPANIO_BUILD_BENCHMARKS "Build the SpanIO benchmark program" OFF)
 
 # Feature switches. Each maps to the macro of the same name and is off by
-# default to keep the core small. Options for SSL and coroutines will be
-# added together with those modules.
+# default to keep the core small. The option for SSL will be added together
+# with that module.
 option(SPANIO_ENABLE_LOG "Enable the built-in lightweight logging" OFF)
 
 # Linux only: prefer the native io_uring proactor (raw system calls, no
 # liburing); falls back to epoll at run time when the kernel lacks io_uring
 option(SPANIO_ENABLE_IO_URING "Linux: use the io_uring backend when the kernel supports it" OFF)
+
+# C++20 coroutines (spanio/coroutine.h, included by spanio/spanio.h). Turning it
+# on makes the spanio target require C++20; the core stays C++17 otherwise
+option(SPANIO_ENABLE_COROUTINE "Enable C++20 coroutine support (awaitable, co_spawn)" OFF)
 
 # Windows only: use the readiness emulation (reactor_proactor over the
 # IOCP + AFD poll reactor) instead of the native IOCP proactor
@@ -73,6 +77,11 @@ endif()
 # for Linux
 if(SPANIO_ENABLE_IO_URING)
     target_compile_definitions(spanio INTERFACE SPANIO_ENABLE_IO_URING)
+endif()
+
+if(SPANIO_ENABLE_COROUTINE)
+    target_compile_definitions(spanio INTERFACE SPANIO_ENABLE_COROUTINE)
+    target_compile_features(spanio INTERFACE cxx_std_20)
 endif()
 
 if(SPANIO_BUILD_TESTS)

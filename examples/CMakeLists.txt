@@ -17,6 +17,7 @@ set(SPANIO_EXAMPLE_NAMES
     timer_demo
     tcp_client
     udp_client
+    coro_echo_server
 )
 
 foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)
@@ -28,3 +29,6 @@ foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)
     # Show examples under an "examples" solution folder in Visual Studio
     set_target_properties(${example_name} PROPERTIES FOLDER "examples")
 endforeach()
+
+# The coroutine example needs C++20; the others stay C++17
+target_compile_features(coro_echo_server PRIVATE cxx_std_20)

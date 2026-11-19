@@ -41,6 +41,7 @@
 #ifndef SPANIO_TCP_H
 #define SPANIO_TCP_H
 
+#include "spanio/async_result.h"
 #include "spanio/buffer.h"
 #include "spanio/error.h"
 #include "spanio/io_context.h"
@@ -271,6 +272,12 @@ public:
     // Native socket handle type (SOCKET on Windows, int on Linux)
     using native_handle_type = detail::native_handle_t;
 
+    // Completion signature of async_connect
+    using connect_signature = void(std::error_code);
+
+    // Completion signature of the reads and writes
+    using transfer_signature = void(std::error_code, std::size_t);
+
     // Create a socket that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
     explicit socket(io_context& context) noexcept
@@ -447,10 +454,92 @@ public:
     }
 
     // Connect to a remote endpoint, opening the socket first if needed
+    // Parameter peer:  address to connect to
+    // Parameter token: completion token (see async_result.h); a callback is
+    //                  called as handler(std::error_code)
+    // Return value: void for a callback, otherwise what the token produces
+    //               (e.g. a std::future<void> for use_future)
+    template <typename Token>
+    auto async_connect(const endpoint& peer, Token&& token) -> async_return_t<Token, connect_signature>
+    {
+        auto initiation = [this, peer](auto&& handler)
+        {
+            start_connect(peer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<connect_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+    // Read whatever is available, at most buffer.size() bytes
+    // Parameter buffer: destination; valid until the operation completes
+    // Parameter token:  completion token; a callback is called as
+    //                   handler(std::error_code, bytes read), with
+    //                   spanio::error::misc_errors::eof when the peer closed
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_read_some(const mutable_buffer& buffer, Token&& token) -> async_return_t<Token, transfer_signature>
+    {
+        auto initiation = [this, buffer](auto&& handler)
+        {
+            start_read_some(buffer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<transfer_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+    // Send part or all of a buffer (one send call)
+    // Parameter buffer: source; valid until the operation completes
+    // Parameter token:  completion token; a callback is called as
+    //                   handler(std::error_code, bytes sent)
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_write_some(const const_buffer& buffer, Token&& token) -> async_return_t<Token, transfer_signature>
+    {
+        auto initiation = [this, buffer](auto&& handler)
+        {
+            start_write_some(buffer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<transfer_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+    // Send the whole buffer, in as many sends as needed
+    // Parameter buffer: source; valid until the operation completes
+    // Parameter token:  completion token; a callback is called once as
+    //                   handler(std::error_code, bytes sent), bytes sent
+    //                   equal to buffer.size() on success
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_write(const const_buffer& buffer, Token&& token) -> async_return_t<Token, transfer_signature>
+    {
+        auto initiation = [this, buffer](auto&& handler)
+        {
+            start_write(buffer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<transfer_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+    // Fill the whole buffer, in as many receives as needed
+    // Parameter buffer: destination; valid until the operation completes
+    // Parameter token:  completion token; a callback is called once as
+    //                   handler(std::error_code, bytes read), bytes read
+    //                   equal to buffer.size() on success. If the peer
+    //                   closes first the error is
+    //                   spanio::error::misc_errors::eof and bytes read is
+    //                   what arrived before
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_read(const mutable_buffer& buffer, Token&& token) -> async_return_t<Token, transfer_signature>
+    {
+        auto initiation = [this, buffer](auto&& handler)
+        {
+            start_read(buffer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<transfer_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+private:
+    // Body of async_connect once the token produced the final handler
     // Parameter peer:    address to connect to
     // Parameter handler: called as handler(std::error_code)
     template <typename Handler>
-    void async_connect(const endpoint& peer, Handler&& handler)
+    void start_connect(const endpoint& peer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open())
@@ -468,12 +557,12 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-    // Read whatever is available, at most buffer.size() bytes
+    // Body of async_read_some once the token produced the final handler
     // Parameter buffer:  destination; valid until the handler runs
     // Parameter handler: called as handler(std::error_code, bytes read);
     //                    spanio::error::misc_errors::eof when the peer closed
     template <typename Handler>
-    void async_read_some(const mutable_buffer& buffer, Handler&& handler)
+    void start_read_some(const mutable_buffer& buffer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open() || buffer.size() == 0)
@@ -487,11 +576,11 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-    // Send part or all of a buffer (one send call)
+    // Body of async_write_some once the token produced the final handler
     // Parameter buffer:  source; valid until the handler runs
     // Parameter handler: called as handler(std::error_code, bytes sent)
     template <typename Handler>
-    void async_write_some(const const_buffer& buffer, Handler&& handler)
+    void start_write_some(const const_buffer& buffer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open() || buffer.size() == 0)
@@ -505,12 +594,12 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-    // Send the whole buffer, in as many sends as needed
+    // Body of async_write once the token produced the final handler
     // Parameter buffer:  source; valid until the handler runs
     // Parameter handler: called once as handler(std::error_code, bytes sent);
     //                    bytes sent equals buffer.size() on success
     template <typename Handler>
-    void async_write(const const_buffer& buffer, Handler&& handler)
+    void start_write(const const_buffer& buffer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open() || buffer.size() == 0)
@@ -524,7 +613,7 @@ public:
         op.start();
     }
 
-    // Fill the whole buffer, in as many receives as needed
+    // Body of async_read once the token produced the final handler
     // Parameter buffer:  destination; valid until the handler runs
     // Parameter handler: called once as handler(std::error_code, bytes read);
     //                    bytes read equals buffer.size() on success. If the
@@ -532,7 +621,7 @@ public:
     //                    spanio::error::misc_errors::eof and bytes read is
     //                    what arrived before
     template <typename Handler>
-    void async_read(const mutable_buffer& buffer, Handler&& handler)
+    void start_read(const mutable_buffer& buffer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open() || buffer.size() == 0)
@@ -545,7 +634,6 @@ public:
         op.start();
     }
 
-private:
     // Report a transfer that needs no I/O through the context: a closed
     // socket fails with bad_file_descriptor, an empty buffer succeeds with
     // 0 bytes
@@ -656,6 +744,9 @@ class acceptor
 public:
     // Native socket handle type (SOCKET on Windows, int on Linux)
     using native_handle_type = detail::native_handle_t;
+
+    // Completion signature of async_accept
+    using accept_signature = void(std::error_code, socket);
 
     // Create an acceptor that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
@@ -853,11 +944,26 @@ public:
     }
 
     // Accept one connection
-    // Parameter handler: called as handler(std::error_code, tcp::socket);
-    //                    the socket is open on success and belongs to the
-    //                    same context as the acceptor
+    // Parameter token: completion token (see async_result.h); a callback is
+    //                  called as handler(std::error_code, tcp::socket). The
+    //                  socket is open on success and belongs to the same
+    //                  context as the acceptor
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_accept(Token&& token) -> async_return_t<Token, accept_signature>
+    {
+        auto initiation = [this](auto&& handler)
+        {
+            start_accept(std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<accept_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+private:
+    // Body of async_accept once the token produced the final handler
+    // Parameter handler: called as handler(std::error_code, tcp::socket)
     template <typename Handler>
-    void async_accept(Handler&& handler)
+    void start_accept(Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open())
@@ -872,7 +978,6 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-private:
     // Context that runs the handlers; never null
     io_context* m_context;
     // Native listening socket, or kInvalidHandle when not open

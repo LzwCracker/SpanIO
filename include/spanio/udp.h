@@ -43,6 +43,7 @@
 #ifndef SPANIO_UDP_H
 #define SPANIO_UDP_H
 
+#include "spanio/async_result.h"
 #include "spanio/buffer.h"
 #include "spanio/error.h"
 #include "spanio/io_context.h"
@@ -143,6 +144,12 @@ class socket
 public:
     // Native socket handle type (SOCKET on Windows, int on Linux)
     using native_handle_type = detail::native_handle_t;
+
+    // Completion signature of async_receive_from
+    using receive_signature = void(std::error_code, std::size_t, endpoint);
+
+    // Completion signature of async_send_to
+    using send_signature = void(std::error_code, std::size_t);
 
     // Create a socket that is not open yet
     // Parameter context: context that runs its handlers; must outlive it
@@ -315,13 +322,48 @@ public:
     }
 
     // Receive one datagram
-    // Parameter buffer:  destination; valid until the handler runs. An empty
-    //                    buffer succeeds at once with 0 bytes and takes no
-    //                    datagram.
-    // Parameter handler: called as handler(std::error_code, bytes received,
-    //                    const udp::endpoint& sender)
+    // Parameter buffer: destination; valid until the operation completes. An
+    //                   empty buffer succeeds at once with 0 bytes and takes
+    //                   no datagram.
+    // Parameter token:  completion token (see async_result.h); a callback is
+    //                   called as handler(std::error_code, bytes received,
+    //                   const udp::endpoint& sender)
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_receive_from(const mutable_buffer& buffer, Token&& token)
+        -> async_return_t<Token, receive_signature>
+    {
+        auto initiation = [this, buffer](auto&& handler)
+        {
+            start_receive_from(buffer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<receive_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+    // Send one datagram, opening the socket first if needed
+    // Parameter buffer: source; valid until the operation completes. An empty
+    //                   buffer sends an empty datagram.
+    // Parameter peer:   destination
+    // Parameter token:  completion token; a callback is called as
+    //                   handler(std::error_code, bytes sent)
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_send_to(const const_buffer& buffer, const endpoint& peer, Token&& token)
+        -> async_return_t<Token, send_signature>
+    {
+        auto initiation = [this, buffer, peer](auto&& handler)
+        {
+            start_send_to(buffer, peer, std::forward<decltype(handler)>(handler));
+        };
+        return async_initiate<send_signature>(std::move(initiation), std::forward<Token>(token));
+    }
+
+private:
+    // Body of async_receive_from once the token produced the final handler
+    // Parameter buffer:  destination
+    // Parameter handler: called as handler(std::error_code, bytes, sender)
     template <typename Handler>
-    void async_receive_from(const mutable_buffer& buffer, Handler&& handler)
+    void start_receive_from(const mutable_buffer& buffer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open() || buffer.size() == 0)
@@ -336,13 +378,12 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-    // Send one datagram, opening the socket first if needed
-    // Parameter buffer:  source; valid until the handler runs. An empty
-    //                    buffer sends an empty datagram.
+    // Body of async_send_to once the token produced the final handler
+    // Parameter buffer:  source
     // Parameter peer:    destination
     // Parameter handler: called as handler(std::error_code, bytes sent)
     template <typename Handler>
-    void async_send_to(const const_buffer& buffer, const endpoint& peer, Handler&& handler)
+    void start_send_to(const const_buffer& buffer, const endpoint& peer, Handler&& handler)
     {
         using handler_type = typename std::decay<Handler>::type;
         if (!is_open())
@@ -361,7 +402,6 @@ public:
         detail::context_access::start_io(*m_context, op);
     }
 
-private:
     // Context that runs the handlers; never null
     io_context* m_context;
     // Native socket, or kInvalidHandle when not open

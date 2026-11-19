@@ -28,4 +28,10 @@
 #include "spanio/udp.h"
 #include "spanio/udp_server.h"
 
+// C++20 coroutine support (awaitable, use_awaitable, co_spawn) is opt-in,
+// so the rest of the library keeps building as C++17
+#if defined(SPANIO_ENABLE_COROUTINE)
+#include "spanio/coroutine.h"
+#endif
+
 #endif // SPANIO_SPANIO_H

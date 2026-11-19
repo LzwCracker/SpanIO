@@ -30,6 +30,8 @@ set(SPANIO_TEST_NAMES
     test_client_examples
     test_guide
     test_benchmark
+    test_completion_tokens
+    test_coroutine
 )
 
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
@@ -43,6 +45,16 @@ foreach(test_name IN LISTS SPANIO_TEST_NAMES)
     set_target_properties(${test_name} PROPERTIES FOLDER "tests")
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# The coroutine tests need C++20; every other test keeps checking that the
+# library builds as C++17
+target_compile_features(test_coroutine PRIVATE cxx_std_20)
+
+# The guide's snippets include coroutines: build test_guide as C++20 with the
+# option's macro, which also checks that spanio/spanio.h then includes
+# spanio/coroutine.h
+target_compile_features(test_guide PRIVATE cxx_std_20)
+target_compile_definitions(test_guide PRIVATE SPANIO_ENABLE_COROUTINE)
 
 # The code snippets of docs/guide.md must be the code test_guide compiles
 add_test(NAME guide_snippets_match

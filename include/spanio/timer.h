@@ -40,6 +40,7 @@
 #ifndef SPANIO_TIMER_H
 #define SPANIO_TIMER_H
 
+#include "spanio/async_result.h"
 #include "spanio/io_context.h"
 #include "spanio/detail/timer_queue.h"
 
@@ -59,6 +60,9 @@ public:
     using clock = detail::timer_clock;
     // Length of a wait
     using duration = clock::duration;
+
+    // Completion signature of async_wait
+    using wait_signature = void(std::error_code);
     // A point in time on the clock
     using time_point = detail::timer_time_point;
 
@@ -123,11 +127,19 @@ public:
     }
 
     // Wait for the timer to expire
-    // Parameter handler: called as handler(std::error_code)
-    template <typename Handler>
-    void async_wait(Handler&& handler)
+    // Parameter token: completion token (see async_result.h); a callback is
+    //                  called as handler(std::error_code), with
+    //                  errc::operation_canceled when the wait was cancelled
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_wait(Token&& token) -> async_return_t<Token, wait_signature>
     {
-        detail::context_access::schedule_timer(*m_context, m_state, m_expiry, detail::make_wait_op(std::forward<Handler>(handler)));
+        auto initiation = [this](auto&& handler)
+        {
+            detail::context_access::schedule_timer(*m_context, m_state, m_expiry,
+                                                   detail::make_wait_op(std::forward<decltype(handler)>(handler)));
+        };
+        return async_initiate<wait_signature>(std::move(initiation), std::forward<Token>(token));
     }
 
     // Cancel pending waits; their handlers get errc::operation_canceled

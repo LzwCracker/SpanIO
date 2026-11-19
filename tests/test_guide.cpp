@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -797,6 +798,140 @@ SPANIO_TEST(strand_counter)
     // [/snippet]
 
     SPANIO_CHECK(counter == kIncrements + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Guide 9: completion tokens and coroutines
+// ---------------------------------------------------------------------------
+
+// Case 14: use_future, waited for on a thread that does not run the context
+SPANIO_TEST(future_token)
+{
+    spanio::io_context context;
+    spanio::tcp::resolver resolver(context);
+
+    // [snippet use_future]
+    spanio::steady_timer timer(context, std::chrono::milliseconds(10));
+    std::future<void> waited = timer.async_wait(spanio::use_future);
+    std::future<std::vector<spanio::tcp::endpoint>> resolved =
+        resolver.async_resolve("127.0.0.1", "80", spanio::use_future);
+
+    auto run_context = [&context]()
+    {
+        context.run();
+    };
+    std::thread runner(run_context);
+    waited.get();                                     // an error would be thrown as std::system_error
+    std::vector<spanio::tcp::endpoint> endpoints = resolved.get();
+    runner.join();
+    // [/snippet]
+
+    SPANIO_REQUIRE(endpoints.size() == 1);
+    SPANIO_CHECK(endpoints.front().address().to_string() == "127.0.0.1");
+}
+
+// [snippet coroutine_echo]
+spanio::awaitable<void> echo_session(spanio::tcp::socket socket)
+{
+    char data[1024];
+    for (;;)
+    {
+        // as_tuple: errors are values; eof means the client closed
+        auto [ec, n] = co_await socket.async_read_some(spanio::buffer(data),
+                                                       spanio::as_tuple(spanio::use_awaitable));
+        if (ec)
+        {
+            co_return;
+        }
+        // use_awaitable alone: an error is thrown as std::system_error
+        co_await socket.async_write(spanio::buffer(data, n), spanio::use_awaitable);
+    }
+}
+
+spanio::awaitable<void> echo_listener(spanio::tcp::acceptor& acceptor)
+{
+    for (;;)
+    {
+        // Throws operation_canceled once the acceptor is closed, ending the loop
+        spanio::tcp::socket peer = co_await acceptor.async_accept(spanio::use_awaitable);
+        spanio::io_context& context = peer.context();
+        spanio::co_spawn(context, echo_session(std::move(peer)), spanio::detached);
+    }
+}
+// [/snippet]
+
+namespace {
+
+// Client of the coroutine echo case: sends a line, reads it back, then has
+// the context close the acceptor so the server ends
+class coroutine_echo_client
+{
+public:
+    // Parameter context:  context the server runs on
+    // Parameter acceptor: the server's acceptor, closed at the end
+    // Parameter port:     the server's port
+    // Parameter reply:    receives what came back
+    coroutine_echo_client(spanio::io_context& context, spanio::tcp::acceptor& acceptor, std::uint16_t port,
+                          std::string& reply)
+        : m_context(&context)
+        , m_acceptor(&acceptor)
+        , m_port(port)
+        , m_reply(&reply)
+    {
+    }
+
+    // Talk to the server, then stop it
+    void operator()()
+    {
+        socket_guard client;
+        if (connect_client(m_port, client) && send_all(client.get(), kHelloLine.data(), kHelloLine.size()))
+        {
+            std::string data(kHelloLine.size(), '\0');
+            if (recv_exact(client.get(), &data[0], data.size()))
+            {
+                *m_reply = data;
+            }
+        }
+        client.reset();
+        spanio::tcp::acceptor* const acceptor = m_acceptor;
+        auto close_acceptor = [acceptor]()
+        {
+            acceptor->close();
+        };
+        m_context->post(close_acceptor);
+    }
+
+private:
+    // Context the server runs on
+    spanio::io_context* m_context;
+    // The server's acceptor
+    spanio::tcp::acceptor* m_acceptor;
+    // The server's port
+    std::uint16_t m_port;
+    // Where the echoed line goes
+    std::string* m_reply;
+};
+
+}
+
+// Case 15: the coroutine echo service, started with co_spawn
+SPANIO_TEST(coroutine_echo_service)
+{
+    spanio::io_context context;
+    spanio::tcp::acceptor acceptor(context, spanio::tcp::endpoint(spanio::ipv4::loopback(), kAnyPort));
+    std::error_code ec;
+    const std::uint16_t port = acceptor.local_endpoint(ec).port();
+    SPANIO_REQUIRE(!ec);
+    std::string reply;
+    std::thread client(coroutine_echo_client(context, acceptor, port, reply));
+
+    // [snippet co_spawn]
+    spanio::co_spawn(context, echo_listener(acceptor), spanio::detached);
+    context.run();                // as many threads as wanted, as in 1.2
+    // [/snippet]
+
+    client.join();
+    SPANIO_CHECK(reply == kHelloLine);
 }
 
 int main(int argc, char** argv)

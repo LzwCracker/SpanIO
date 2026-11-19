@@ -44,6 +44,7 @@
 #ifndef SPANIO_RESOLVER_H
 #define SPANIO_RESOLVER_H
 
+#include "spanio/async_result.h"
 #include "spanio/error.h"
 #include "spanio/io_context.h"
 #include "spanio/ip.h"
@@ -482,6 +483,9 @@ public:
     // Endpoint type the results use
     using endpoint = ip::endpoint;
 
+    // Completion signature of async_resolve
+    using resolve_signature = void(std::error_code, std::vector<endpoint>);
+
     // Parameter context: context that runs the handlers; must outlive it
     explicit basic_resolver(io_context& context)
         : basic_resolver(context, &detail::system_resolve)
@@ -521,16 +525,27 @@ public:
     // Resolve on the worker thread
     // Parameter host:    host name or numeric address; may be empty
     // Parameter service: service name or port number; may be empty
-    // Parameter handler: called as handler(std::error_code, std::vector<endpoint>)
+    // Parameter token:   completion token (see async_result.h); a callback
+    //                    is called as handler(std::error_code,
+    //                    std::vector<endpoint>)
     // Parameter options: families and numeric-only flags
-    template <typename Handler>
-    void async_resolve(std::string_view host, std::string_view service, Handler&& handler,
+    // Return value: void for a callback, otherwise what the token produces
+    template <typename Token>
+    auto async_resolve(std::string_view host, std::string_view service, Token&& token,
                        const resolve_options& options = resolve_options())
+        -> async_return_t<Token, resolve_signature>
     {
-        using handler_type = typename std::decay<Handler>::type;
-        std::unique_ptr<detail::resolve_op_base> op(new detail::resolve_op<handler_type>(
-            *m_context, std::string(host), std::string(service), options, std::forward<Handler>(handler)));
-        m_worker->submit(std::move(op));
+        // Copied now: the views may not outlive this call, and a lazy token
+        // (use_awaitable) starts the operation later
+        auto initiation = [this, host_copy = std::string(host), service_copy = std::string(service),
+                           options](auto&& handler)
+        {
+            using handler_type = typename std::decay<decltype(handler)>::type;
+            std::unique_ptr<detail::resolve_op_base> op(new detail::resolve_op<handler_type>(
+                *m_context, host_copy, service_copy, options, std::forward<decltype(handler)>(handler)));
+            m_worker->submit(std::move(op));
+        };
+        return async_initiate<resolve_signature>(std::move(initiation), std::forward<Token>(token));
     }
 
     // Complete pending requests with errc::operation_canceled
@@ -677,18 +692,27 @@ namespace spanio { namespace tcp {
 // Parameter sock:      socket to connect; it is closed and reopened for each
 //                      attempt, and must outlive the operation
 // Parameter endpoints: candidates in order, e.g. a resolver's result
-// Parameter handler:   called as handler(std::error_code, const tcp::endpoint&
+// Parameter token:     completion token (see async_result.h); a callback is
+//                      called as handler(std::error_code, const tcp::endpoint&
 //                      connected). On failure the error is that of the last
 //                      attempt, or error::netdb_errors::host_not_found for an empty list.
 //                      Cancelling or closing the socket stops the sequence:
 //                      the handler gets errc::operation_canceled and no
 //                      further endpoint is tried.
-template <typename Handler>
-void async_connect(socket& sock, std::vector<endpoint> endpoints, Handler&& handler)
+// Return value: void for a callback, otherwise what the token produces
+template <typename Token>
+auto async_connect(socket& sock, std::vector<endpoint> endpoints, Token&& token)
+    -> async_return_t<Token, void(std::error_code, endpoint)>
 {
-    using handler_type = typename std::decay<Handler>::type;
-    detail::connect_sequence_op<handler_type> op(sock, std::move(endpoints), std::forward<Handler>(handler));
-    op.start();
+    socket* const target = &sock;
+    auto initiation = [target, list = std::move(endpoints)](auto&& handler) mutable
+    {
+        using handler_type = typename std::decay<decltype(handler)>::type;
+        detail::connect_sequence_op<handler_type> op(*target, std::move(list),
+                                                     std::forward<decltype(handler)>(handler));
+        op.start();
+    };
+    return async_initiate<void(std::error_code, endpoint)>(std::move(initiation), std::forward<Token>(token));
 }
 
 }}

@@ -77,6 +77,51 @@ using spanio::test::backend_factory;
 using spanio::test::backends;
 using spanio::test::kAnyPort;
 using spanio::test::make_context;
+namespace api_test {
+
+// Value the custom token returns from every async_* call
+constexpr int kTicket = 42;
+
+}
+
+namespace {
+
+// Forward declaration for the custom token below
+struct transfer_record;
+
+}
+
+namespace api_test {
+
+// A completion token defined outside the library: the async_* call returns
+// kTicket and the completion is recorded
+struct ticket_token
+{
+    // Where the completion is recorded
+    transfer_record* m_record;
+};
+
+}
+
+namespace spanio {
+
+// How ticket_token delivers an (error, bytes) completion
+template <>
+class async_result<api_test::ticket_token, void(std::error_code, std::size_t)>
+{
+public:
+    // The async_* call returns a ticket
+    using return_type = int;
+
+    // Start the operation with a handler that records into the token's record
+    // Parameter initiation: function object taking the handler
+    // Parameter token:      the ticket_token
+    // Return value: kTicket
+    template <typename Initiation, typename RawToken>
+    static int initiate(Initiation&& initiation, RawToken&& token);
+};
+
+}
 namespace tcp = spanio::tcp;
 namespace udp = spanio::udp;
 namespace error = spanio::error;
@@ -231,15 +276,26 @@ std::vector<char> pattern(std::size_t size)
 
 }
 
-// Case 1: spanio/spanio.h alone provides the public API; the version is 0.3.0
+namespace spanio {
+
+template <typename Initiation, typename RawToken>
+int async_result<api_test::ticket_token, void(std::error_code, std::size_t)>::initiate(Initiation&& initiation,
+                                                                                    RawToken&& token)
+{
+    std::forward<Initiation>(initiation)(record_transfer(*token.m_record));
+    return api_test::kTicket;
+}
+
+}
+// Case 1: spanio/spanio.h alone provides the public API; the version is 0.4.0
 SPANIO_TEST(umbrella_header)
 {
     static_assert(SPANIO_VERSION_MAJOR == 0, "major version");
-    static_assert(SPANIO_VERSION_MINOR == 3, "minor version");
-    static_assert(SPANIO_VERSION_PATCH == 1, "patch version");
-    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 3, 1), "combined version");
-    static_assert(SPANIO_MAKE_VERSION(0, 3, 1) > SPANIO_MAKE_VERSION(0, 3, 0), "versions compare in order");
-    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.3.1") == 0);
+    static_assert(SPANIO_VERSION_MINOR == 4, "minor version");
+    static_assert(SPANIO_VERSION_PATCH == 0, "patch version");
+    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 4, 0), "combined version");
+    static_assert(SPANIO_MAKE_VERSION(0, 4, 0) > SPANIO_MAKE_VERSION(0, 3, 1), "versions compare in order");
+    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.4.0") == 0);
 
     // One type or function from every public header
     static_assert(std::is_class<spanio::io_context>::value, "io_context.h");
@@ -494,6 +550,70 @@ SPANIO_TEST(user_data)
     SPANIO_CHECK(true);
 }
 
+// Case 8: with a callback, every async_* function still returns void, so
+// code written before completion tokens existed compiles unchanged
+SPANIO_TEST(callback_tokens_return_void)
+{
+    using callback_ec = void (*)(std::error_code);
+    using callback_transfer = void (*)(std::error_code, std::size_t);
+    using callback_accept = void (*)(std::error_code, tcp::socket);
+    using callback_receive = void (*)(std::error_code, std::size_t, const udp::endpoint&);
+    using callback_resolve = void (*)(std::error_code, std::vector<tcp::endpoint>);
+    using callback_sequence = void (*)(std::error_code, const tcp::endpoint&);
+    static_assert(std::is_void<decltype(std::declval<tcp::socket&>().async_connect(tcp::endpoint(), callback_ec()))>::value, "connect");
+    static_assert(std::is_void<decltype(std::declval<tcp::socket&>().async_read_some(spanio::mutable_buffer(), callback_transfer()))>::value,
+                  "read_some");
+    static_assert(std::is_void<decltype(std::declval<tcp::socket&>().async_write_some(spanio::const_buffer(), callback_transfer()))>::value,
+                  "write_some");
+    static_assert(std::is_void<decltype(std::declval<tcp::socket&>().async_read(spanio::mutable_buffer(), callback_transfer()))>::value,
+                  "read");
+    static_assert(std::is_void<decltype(std::declval<tcp::socket&>().async_write(spanio::const_buffer(), callback_transfer()))>::value,
+                  "write");
+    static_assert(std::is_void<decltype(std::declval<tcp::acceptor&>().async_accept(callback_accept()))>::value,
+                  "accept");
+    static_assert(std::is_void<decltype(std::declval<udp::socket&>().async_receive_from(
+                      spanio::mutable_buffer(), callback_receive()))>::value,
+                  "receive_from");
+    static_assert(std::is_void<decltype(std::declval<udp::socket&>().async_send_to(
+                      spanio::const_buffer(), udp::endpoint(), callback_transfer()))>::value,
+                  "send_to");
+    static_assert(std::is_void<decltype(std::declval<spanio::steady_timer&>().async_wait(callback_ec()))>::value,
+                  "wait");
+    static_assert(std::is_void<decltype(std::declval<tcp::resolver&>().async_resolve("", "", callback_resolve()))>::value,
+                  "resolve");
+    static_assert(std::is_void<decltype(tcp::async_connect(std::declval<tcp::socket&>(), std::vector<tcp::endpoint>(),
+                                                           callback_sequence()))>::value,
+                  "connect sequence");
+    SPANIO_CHECK(true);
+}
+
+// Case 9: a token type defined outside the library is honoured through its
+// own async_result specialization: its return value reaches the caller and
+// the handler it builds receives the completion exactly once
+SPANIO_TEST(custom_completion_token)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        transfer_record record;
+        std::unique_ptr<io_context> ctx = make_context(backend);
+        tcp::acceptor acc(*ctx, tcp::endpoint(spanio::ipv4::loopback(), kAnyPort));
+        tcp::socket client(*ctx);
+        tcp::socket server(*ctx);
+        connect_pair(*ctx, acc, client, server);
+
+        const char message[] = "token";
+        const int ticket = client.async_write(spanio::buffer(message, sizeof(message)),
+                                              api_test::ticket_token{&record});
+        SPANIO_CHECK(ticket == api_test::kTicket);
+        // Like a callback, the handler never runs inside the call
+        SPANIO_CHECK(record.m_calls == 0);
+        ctx->run();
+        SPANIO_CHECK(record.m_calls == 1);
+        SPANIO_CHECK(!record.m_ec);
+        SPANIO_CHECK(record.m_bytes == sizeof(message));
+    }
+}
 int main(int argc, char** argv)
 {
     return spanio::test::run_all(argc, argv);

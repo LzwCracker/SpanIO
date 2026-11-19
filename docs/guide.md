@@ -15,9 +15,10 @@
 - [6. 定时器](#6-定时器)
 - [7. 域名解析](#7-域名解析)
 - [8. 多线程与 strand](#8-多线程与-strand)
-- [9. 错误码参考](#9-错误码参考)
-- [10. 平台说明](#10-平台说明)
-- [11. 常见问题](#11-常见问题)
+- [9. 完成令牌与协程](#9-完成令牌与协程)
+- [10. 错误码参考](#10-错误码参考)
+- [11. 平台说明](#11-平台说明)
+- [12. 常见问题](#12-常见问题)
 - [附录 A：API 速查](#附录-aapi-速查)
 - [附录 B：示例程序](#附录-b示例程序)
 
@@ -104,6 +105,7 @@ int main()
 |---|---|
 | `SPANIO_ENABLE_LOG`（CMake 选项 `-DSPANIO_ENABLE_LOG=ON`） | 关键路径出错时向 stderr 打印日志，排查问题时打开 |
 | `SPANIO_WINDOWS_USE_AFD_REACTOR`（CMake 选项同名） | Windows 上不用原生 IOCP，改用就绪通知模拟（与 Linux 同一套代码路径），一般不需要 |
+| `SPANIO_ENABLE_COROUTINE`（CMake 选项同名） | 开启 C++20 协程支持（`awaitable`、`co_spawn`，见第 9 节），需要 C++20 编译；不开时整个库只需要 C++17 |
 | `SPANIO_ENABLE_IO_URING`（CMake 选项同名） | Linux 上优先使用 io_uring 后端（需内核 5.11+，不依赖 liburing）；内核不支持或被禁止时自动退回 epoll |
 
 ---
@@ -249,7 +251,7 @@ catch (const std::system_error& e)
 }
 ```
 
-各种情况具体对应哪个错误码，见第 9 节。
+各种情况具体对应哪个错误码，见第 10 节。
 
 ---
 
@@ -489,7 +491,7 @@ server.start();     // the caller runs the context; server.run(n) runs its own
 - `stop_gracefully(grace)`：停止接受新连接，对每个连接 `close()`；超过 `grace` 还没关的强制关闭（`close_timeout`）。
 - 一个 `tcp_server` 只能启动一次。
 
-`on_close` 收到的原因：本端 `close()` / `abort()` / `stop()` 为空；客户端正常断开为 `eof`；其他见第 9 节。
+`on_close` 收到的原因：本端 `close()` / `abort()` / `stop()` 为空；客户端正常断开为 `eof`；其他见第 10 节。
 
 ### 5.2 分帧
 
@@ -714,7 +716,104 @@ for (std::thread& thread : threads)
 
 ---
 
-## 9. 错误码参考
+## 9. 完成令牌与协程
+
+每个 `async_xxx` 的最后一个参数叫**完成令牌**，它决定结果怎样交给你。前面各章传的都是回调；换一个令牌，同一个函数就有另一种用法，底层仍是同一套完成事件。
+
+| 令牌 | `async_xxx` 返回 | 结果怎样交给你 | 头文件 |
+|---|---|---|---|
+| 回调 | `void` | 调用回调 | — |
+| `spanio::use_future` | `std::future<值>` | `get()` 取值；出错时抛 `std::system_error` | `spanio/async_result.h` |
+| `spanio::use_awaitable` | `spanio::awaitable<值>` | `co_await` 得到值；出错时抛 `std::system_error` | `spanio/coroutine.h`（C++20） |
+| `spanio::as_tuple(令牌)` | 同内层令牌 | 整个结果（含错误码）打包成一个 `std::tuple`，不抛异常 | `spanio/async_result.h` |
+| `spanio::detached` | `void` | 丢弃结果 | `spanio/async_result.h` |
+
+"值"由回调签名决定：去掉开头的 `std::error_code`，剩下没有参数就是 `void`，一个参数就是它本身，多个参数是 `std::tuple`。例如 `async_read_some` 的值是 `std::size_t`，`async_accept` 的值是 `tcp::socket`，`async_connect` 和 `async_wait` 没有值。
+
+### 9.1 `use_future`
+
+<!-- snippet: use_future -->
+```cpp
+spanio::steady_timer timer(context, std::chrono::milliseconds(10));
+std::future<void> waited = timer.async_wait(spanio::use_future);
+std::future<std::vector<spanio::tcp::endpoint>> resolved =
+    resolver.async_resolve("127.0.0.1", "80", spanio::use_future);
+
+auto run_context = [&context]()
+{
+    context.run();
+};
+std::thread runner(run_context);
+waited.get();                                     // an error would be thrown as std::system_error
+std::vector<spanio::tcp::endpoint> endpoints = resolved.get();
+runner.join();
+```
+
+`get()` 会阻塞，必须在**没有运行这个 `io_context` 的线程**上调用：否则这个线程在等结果，而它又是唯一能产生结果的线程，会永远卡住。`io_context` 在操作完成前被销毁时，`get()` 抛 `std::future_error`（`broken_promise`）。
+
+### 9.2 协程（C++20）
+
+开启方法：用 C++20 编译（`-std=c++20` / `/std:c++20`），并定义 `SPANIO_ENABLE_COROUTINE`（CMake 选项同名）让 `spanio/spanio.h` 包含协程支持，或者直接 `#include "spanio/coroutine.h"`。不用协程的代码仍然只需要 C++17。
+
+协程的返回类型是 `spanio::awaitable<T>`。在协程里用 `co_await` 等待异步操作，代码按顺序写，不用拆成一个个回调：
+
+<!-- snippet: coroutine_echo -->
+```cpp
+spanio::awaitable<void> echo_session(spanio::tcp::socket socket)
+{
+    char data[1024];
+    for (;;)
+    {
+        // as_tuple: errors are values; eof means the client closed
+        auto [ec, n] = co_await socket.async_read_some(spanio::buffer(data),
+                                                       spanio::as_tuple(spanio::use_awaitable));
+        if (ec)
+        {
+            co_return;
+        }
+        // use_awaitable alone: an error is thrown as std::system_error
+        co_await socket.async_write(spanio::buffer(data, n), spanio::use_awaitable);
+    }
+}
+
+spanio::awaitable<void> echo_listener(spanio::tcp::acceptor& acceptor)
+{
+    for (;;)
+    {
+        // Throws operation_canceled once the acceptor is closed, ending the loop
+        spanio::tcp::socket peer = co_await acceptor.async_accept(spanio::use_awaitable);
+        spanio::io_context& context = peer.context();
+        spanio::co_spawn(context, echo_session(std::move(peer)), spanio::detached);
+    }
+}
+```
+
+用 `co_spawn` 启动协程：
+
+<!-- snippet: co_spawn -->
+```cpp
+spanio::co_spawn(context, echo_listener(acceptor), spanio::detached);
+context.run();                // as many threads as wanted, as in 1.2
+```
+
+要点：
+
+- **`co_spawn(执行器, 协程, 令牌)`**：执行器可以是 `io_context`、`context.get_executor()` 或 strand。它从不在调用里直接运行协程，而是像 `post` 一样排队。
+- **协程结束时**：由令牌决定怎样通知你。`spanio::detached` 表示不关心；回调的签名是 `void(std::exception_ptr)`（协程返回 `awaitable<T>` 时是 `void(std::exception_ptr, T)`），协程抛出的异常从这里交给你；`use_future` 得到 `std::future<T>`；在另一个协程里传 `use_awaitable`，就能直接 `co_await` 它的结果。
+- **错误**：`use_awaitable` 把错误码作为 `std::system_error` 抛出，用 `try` / `catch` 处理；`as_tuple(use_awaitable)` 把错误码当作返回值，适合 `eof` 这类正常情况。上面的例子两种都用了。
+- **线程**：每次 `co_await` 之后，协程在某个 `run()` 线程上恢复。多个线程 `run()` 时，不同的协程会并行；在同一个 strand 上 `co_spawn` 的协程不会同时运行，它们共享的数据不用加锁。
+- **取消**：关闭 socket 或取消定时器后，正在等待的 `co_await` 以 `operation_canceled` 结束（用 `use_awaitable` 时是抛出）。
+- **生命周期**：socket 和缓冲区要活到 `co_await` 结束，写成协程的局部变量最简单。`io_context` 被销毁时，挂起中的协程连同它的局部变量一起被销毁，不会泄漏；但协程里还开着的 socket 要先关闭，这一点和回调一样。
+- 不要先保存 `async_xxx(..., use_awaitable)` 返回的对象，过后再 `co_await`：操作要到 `co_await` 时才开始，那时它用到的 socket 和缓冲区必须还在。
+
+完整的程序见 `examples/coro_echo_server.cpp`。
+
+### 9.3 自定义令牌
+
+为自己的令牌类型特化 `spanio::async_result<令牌类型, 签名>`，提供 `return_type` 和 `initiate()`，所有 `async_xxx` 就都能接受它；写法见 `spanio/async_result.h` 的文件头。
+
+---
+## 10. 错误码参考
 
 | 情况 | 错误码 |
 |---|---|
@@ -740,7 +839,7 @@ for (std::thread& thread : threads)
 
 ---
 
-## 10. 平台说明
+## 11. 平台说明
 
 | 平台 | 默认后端 | 说明 |
 |---|---|---|
@@ -755,7 +854,7 @@ for (std::thread& thread : threads)
 
 ---
 
-## 11. 常见问题
+## 12. 常见问题
 
 **`run()` 为什么立刻返回？**
 没有工作了。确认调用 `run()` 之前已经发起了异步操作；如果要让 `run()` 一直等新任务，用 `executor_work_guard`（2.1）。`run()` 返回过一次后，要先 `restart()` 才能再 `run()`。
@@ -782,6 +881,8 @@ for (std::thread& thread : threads)
 | 头文件 | 主要内容 |
 |---|---|
 | `spanio/spanio.h` | 包含下面全部 |
+| `spanio/async_result.h` | 完成令牌：`async_result`、`async_initiate`、`use_future`、`as_tuple`、`detached` |
+| `spanio/coroutine.h` | C++20 协程（定义 `SPANIO_ENABLE_COROUTINE` 时由 `spanio.h` 包含）：`awaitable`、`use_awaitable`、`co_spawn` |
 | `spanio/version.h` | `SPANIO_VERSION_MAJOR/MINOR/PATCH`、`SPANIO_VERSION`、`SPANIO_VERSION_STRING` |
 | `spanio/io_context.h` | `io_context`（`run/run_one/poll/poll_one/stop/stopped/restart/post/dispatch/get_executor/backend_name`）、`executor_work_guard`、`make_work_guard` |
 | `spanio/strand.h` | `strand<Executor>`、`make_strand`、`bind_executor`、`executor_binder` |
@@ -812,6 +913,7 @@ for (std::thread& thread : threads)
 | `timer_demo` | `timer_demo` | `steady_timer` 在回调里重新等待，每半秒打印一次，三次后退出 |
 | `tcp_client` | `tcp_client <主机> <端口> <消息>` | 异步解析、按地址列表连接、`async_write` / `async_read`、整体超时 |
 | `udp_client` | `udp_client <主机> <端口> <消息>` | 同步解析、`async_send_to` / `async_receive_from`、等待超时 |
+| `coro_echo_server` | `coro_echo_server [端口] [线程数]` | 用 C++20 协程写的回显服务：一个协程负责 accept，每个连接一个协程（需 C++20） |
 
 试一试：
 
