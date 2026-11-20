@@ -134,6 +134,38 @@ constexpr std::size_t kSmallBuffer = 16;
 // Bytes each client sends the echo example; more than one read chunk
 constexpr std::size_t kExampleMessageBytes = 10000;
 
+// Longest a log case waits for a line
+constexpr std::chrono::seconds kLogWait(5);
+
+// Pause between checks while waiting for a line
+constexpr std::chrono::milliseconds kLogPoll(10);
+
+// Length of the "HH:MM:SS.mmm" timestamp that starts every log line
+constexpr std::size_t kTimestampLength = 12;
+
+// SO_LINGER on/off value that turns lingering on
+constexpr int kLingerOn = 1;
+
+// SO_LINGER timeout of zero: closing sends RST instead of FIN
+constexpr int kLingerAbortSeconds = 0;
+
+// Message with control characters and a backslash, and how the log shows it
+constexpr char kControlMessage[] = "a\r\n\t\\\x01";
+
+// Length of kControlMessage without the terminating zero
+constexpr std::size_t kControlMessageLength = sizeof(kControlMessage) - 1;
+
+// The escaped form of kControlMessage
+constexpr char kControlEscaped[] = "a\\r\\n\\t\\\\\\x01";
+
+// Size of the message that is cut in the log
+constexpr std::size_t kLongMessageBytes = 200;
+
+// Bytes the first and the second client send in the two-client log case
+constexpr std::size_t kFirstClientBytes = 3;
+
+// See kFirstClientBytes
+constexpr std::size_t kSecondClientBytes = 7;
 // Listening endpoint of an acceptor, or fail the case
 // Parameter acc: open, bound acceptor
 // Return value: its local endpoint
@@ -553,6 +585,183 @@ awaitable<int> uncaught_nested(io_context& ctx)
     co_return value;
 }
 
+// ---- Log cases of the coroutine echo example ---------------------------------
+
+// Collects the example's log lines; safe to read while the server writes.
+// It also counts sink calls that overlap: the example must hand lines over
+// one at a time, so the capture's own mutex must not hide a missing lock.
+class log_capture
+{
+public:
+    // A sink appending to this capture; the capture must outlive it
+    // Return value: the sink
+    coro_echo::log_sink sink()
+    {
+        auto add = [this](const std::string& line)
+        {
+            if (m_inside.fetch_add(1) != 0)
+            {
+                m_overlaps.fetch_add(1);
+            }
+            std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_lines.push_back(line);
+            }
+            m_inside.fetch_sub(1);
+        };
+        return coro_echo::log_sink(add);
+    }
+
+    // Number of sink calls that started while another was running
+    // Return value: 0 when the example serializes its lines
+    int overlaps() const
+    {
+        return m_overlaps.load();
+    }
+
+    // Lines that contain a text, in order
+    // Parameter text: text to look for, e.g. an event tag
+    // Return value: the matching lines
+    std::vector<std::string> with(const std::string& text) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> found;
+        for (const std::string& line : m_lines)
+        {
+            if (line.find(text) != std::string::npos)
+            {
+                found.push_back(line);
+            }
+        }
+        return found;
+    }
+
+    // Wait until at least a number of lines contain a text
+    // Parameter text:  text to look for
+    // Parameter count: lines needed
+    // Return value: true if they appeared within kLogWait
+    bool wait_for(const std::string& text, std::size_t count) const
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kLogWait;
+        while (with(text).size() < count)
+        {
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                return false;
+            }
+            std::this_thread::sleep_for(kLogPoll);
+        }
+        return true;
+    }
+
+private:
+    // Guards m_lines
+    mutable std::mutex m_mutex;
+    // Lines in the order they were written
+    std::vector<std::string> m_lines;
+    // Sink calls running right now
+    std::atomic<int> m_inside{0};
+    // Sink calls that found another one running
+    std::atomic<int> m_overlaps{0};
+};
+
+// Runs the coroutine echo example on its own thread for one backend. The
+// destructor closes the acceptor and waits for run() to end, so clients must
+// be closed before it runs (declare them after the runner).
+class coro_echo_runner
+{
+public:
+    // Parameter backend: proactor to use
+    // Parameter sink:    where the example's lines go
+    coro_echo_runner(const backend_factory& backend, coro_echo::log_sink sink)
+        : m_context(make_context(backend))
+        , m_acceptor(*m_context, tcp::endpoint(spanio::ipv4::loopback(), kAnyPort))
+    {
+        coro_echo::start(*m_context, m_acceptor, std::move(sink));
+        io_context* const context = m_context.get();
+        auto runner = [context]()
+        {
+            context->run();
+        };
+        m_thread = std::thread(runner);
+    }
+
+    // Close the acceptor on the context's thread and wait for run() to end
+    ~coro_echo_runner()
+    {
+        tcp::acceptor* const acceptor = &m_acceptor;
+        auto close_acceptor = [acceptor]()
+        {
+            acceptor->close();
+        };
+        m_context->post(close_acceptor);
+        m_thread.join();
+    }
+
+    coro_echo_runner(const coro_echo_runner&) = delete;
+    coro_echo_runner& operator=(const coro_echo_runner&) = delete;
+
+    // Port the example listens on
+    // Return value: the port
+    std::uint16_t port() const
+    {
+        return listening_endpoint(m_acceptor).port();
+    }
+
+private:
+    // Context the example runs on
+    std::unique_ptr<io_context> m_context;
+    // The example's acceptor
+    tcp::acceptor m_acceptor;
+    // Thread calling run()
+    std::thread m_thread;
+};
+
+// The address text the example logs for a client: its local address
+// Parameter client: connected client socket
+// Return value: e.g. "127.0.0.1:54321"
+std::string client_text(const spanio::test::socket_guard& client)
+{
+    const sockaddr_in local = spanio::test::local_address(client.get());
+    return "127.0.0.1:" + std::to_string(static_cast<unsigned>(ntohs(local.sin_port)));
+}
+
+// Send bytes from a client and read the echo back
+// Parameter client: connected client
+// Parameter data:   bytes to send
+// Return value: true if exactly the same bytes came back
+bool round_trip(const spanio::test::socket_guard& client, const std::string& data)
+{
+    if (!spanio::test::send_all(client.get(), data.data(), data.size()))
+    {
+        return false;
+    }
+    std::string echo(data.size(), '\0');
+    return spanio::test::recv_exact(client.get(), &echo[0], echo.size()) && echo == data;
+}
+
+// Close a client with SO_LINGER 0, so the server sees a reset instead of EOF
+// Parameter client: connected client; closed afterwards
+void reset_client(spanio::test::socket_guard& client)
+{
+    linger option{};
+    option.l_onoff = kLingerOn;
+    option.l_linger = kLingerAbortSeconds;
+    SPANIO_CHECK(::setsockopt(client.get(), SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&option),
+                              static_cast<spanio::detail::socklen_type>(sizeof(option)))
+                 == 0);
+    client.reset();
+}
+
+// Whether a line starts with an HH:MM:SS.mmm timestamp and a space
+// Parameter line: log line
+// Return value: true if it does
+bool has_timestamp(const std::string& line)
+{
+    return line.size() > kTimestampLength && line[kTimestampLength] == ' ' && line[2] == ':' && line[5] == ':'
+        && line[8] == '.';
+}
 } // namespace
 
 // Case 1: co_await of accept, connect, read, write, a timer wait and a
@@ -825,7 +1034,8 @@ SPANIO_TEST(coroutine_echo_example)
         std::unique_ptr<io_context> ctx = make_context(backend);
         tcp::acceptor acc(*ctx, tcp::endpoint(spanio::ipv4::loopback(), kAnyPort));
         const std::uint16_t port = listening_endpoint(acc).port();
-        coro_echo::start(*ctx, acc);
+        // No log: this case is about echoing; the log cases follow
+        coro_echo::start(*ctx, acc, coro_echo::log_sink());
         io_context& context = *ctx;
         auto runner = [&context]()
         {
@@ -860,6 +1070,192 @@ SPANIO_TEST(coroutine_echo_example)
         ctx->post(close_acceptor);
         server_thread.join();
     }
+}
+
+// Case 11: one client: [connect], [recv] and [close] lines with the
+// client's address, the byte count, the reason and the online count
+// (every backend)
+SPANIO_TEST(coroutine_echo_log_single_client)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        coro_echo_runner server(backend, log.sink());
+        spanio::test::socket_guard client;
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), client));
+        const std::string peer = client_text(client);
+        SPANIO_CHECK(round_trip(client, kMessage));
+        client.reset();
+        SPANIO_REQUIRE(log.wait_for("[close]", 1));
+
+        const std::vector<std::string> connects = log.with("[connect]");
+        const std::vector<std::string> receives = log.with("[recv]");
+        const std::vector<std::string> closes = log.with("[close]");
+        SPANIO_REQUIRE(connects.size() == 1);
+        SPANIO_REQUIRE(receives.size() == 1);
+        SPANIO_REQUIRE(closes.size() == 1);
+        SPANIO_CHECK(has_timestamp(connects[0]));
+        SPANIO_CHECK(connects[0].find("[connect] " + peer + "  online 1") != std::string::npos);
+        SPANIO_CHECK(receives[0].find("[recv]    " + peer + "  5 bytes: hello") != std::string::npos);
+        SPANIO_CHECK(closes[0].find("[close]   " + peer + "  client closed, 5 bytes received, connected ")
+                     != std::string::npos);
+        SPANIO_CHECK(closes[0].find(" s, online 0") != std::string::npos);
+        SPANIO_CHECK(log.overlaps() == 0);
+    }
+}
+
+// Case 12: two clients at once: online counts go 1, 2 and back down to 0,
+// and each [close] line has that client's own byte total (every backend)
+SPANIO_TEST(coroutine_echo_log_two_clients)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        coro_echo_runner server(backend, log.sink());
+        spanio::test::socket_guard first;
+        spanio::test::socket_guard second;
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), first));
+        SPANIO_REQUIRE(log.wait_for("[connect]", 1));
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), second));
+        SPANIO_REQUIRE(log.wait_for("[connect]", 2));
+        const std::string first_peer = client_text(first);
+        const std::string second_peer = client_text(second);
+        SPANIO_CHECK(round_trip(first, std::string(kFirstClientBytes, 'a')));
+        SPANIO_CHECK(round_trip(second, std::string(kSecondClientBytes, 'b')));
+
+        first.reset();
+        SPANIO_REQUIRE(log.wait_for("[close]", 1));
+        second.reset();
+        SPANIO_REQUIRE(log.wait_for("[close]", 2));
+
+        const std::vector<std::string> connects = log.with("[connect]");
+        SPANIO_CHECK(connects[0].find(first_peer + "  online 1") != std::string::npos);
+        SPANIO_CHECK(connects[1].find(second_peer + "  online 2") != std::string::npos);
+        const std::vector<std::string> closes = log.with("[close]");
+        SPANIO_CHECK(closes[0].find(first_peer + "  client closed, 3 bytes received") != std::string::npos);
+        SPANIO_CHECK(closes[0].find("online 1") != std::string::npos);
+        SPANIO_CHECK(closes[1].find(second_peer + "  client closed, 7 bytes received") != std::string::npos);
+        SPANIO_CHECK(closes[1].find("online 0") != std::string::npos);
+        SPANIO_CHECK(log.overlaps() == 0);
+    }
+}
+
+// Case 13: control characters are escaped, and a long message shows only its
+// first 64 bytes and its size (every backend)
+SPANIO_TEST(coroutine_echo_log_escapes_and_truncates)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        coro_echo_runner server(backend, log.sink());
+        spanio::test::socket_guard client;
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), client));
+        SPANIO_CHECK(round_trip(client, std::string(kControlMessage, kControlMessageLength)));
+        SPANIO_REQUIRE(log.wait_for("[recv]", 1));
+        // Waits for the first line before sending again, so the two
+        // messages cannot arrive in one read
+        SPANIO_CHECK(round_trip(client, std::string(kLongMessageBytes, 'x')));
+        client.reset();
+        SPANIO_REQUIRE(log.wait_for("[close]", 1));
+
+        const std::vector<std::string> receives = log.with("[recv]");
+        SPANIO_REQUIRE(receives.size() >= 2);
+        SPANIO_CHECK(receives[0].find("6 bytes: " + std::string(kControlEscaped)) != std::string::npos);
+        // TCP may split the long message; the first piece decides the line
+        std::size_t long_total = 0;
+        for (std::size_t i = 1; i < receives.size(); ++i)
+        {
+            const std::size_t at = receives[i].find("  ", receives[i].find("[recv]") + std::strlen("[recv]    "));
+            long_total += std::stoul(receives[i].substr(at + 2));
+        }
+        SPANIO_CHECK(long_total == kLongMessageBytes);
+        if (receives.size() == 2)
+        {
+            const std::string expected = "200 bytes: " + std::string(coro_echo::kShownBytes, 'x') + "... (200 bytes)";
+            SPANIO_CHECK(receives[1].size() >= expected.size());
+            SPANIO_CHECK(receives[1].compare(receives[1].size() - expected.size(), expected.size(), expected) == 0);
+        }
+        // The rules themselves, independent of how TCP split the data
+        SPANIO_CHECK(coro_echo::escape_bytes(std::string(kLongMessageBytes, 'x'))
+                     == std::string(coro_echo::kShownBytes, 'x') + "... (200 bytes)");
+        const std::string utf8 = std::string(coro_echo::kShownBytes - 1, 'a') + "\xE4\xB8\xAD";
+        SPANIO_CHECK(coro_echo::escape_bytes(utf8) == std::string(coro_echo::kShownBytes - 1, 'a') + "... (66 bytes)");
+    }
+}
+
+// Case 14: a client that resets the connection is logged as
+// "connection reset" (every backend)
+SPANIO_TEST(coroutine_echo_log_reset)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture log;
+        coro_echo_runner server(backend, log.sink());
+        spanio::test::socket_guard client;
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), client));
+        const std::string peer = client_text(client);
+        SPANIO_CHECK(round_trip(client, kMessage));
+        reset_client(client);
+        SPANIO_REQUIRE(log.wait_for("[close]", 1));
+        const std::string line = log.with("[close]").front();
+        SPANIO_CHECK(line.find(peer + "  connection reset, 5 bytes received") != std::string::npos);
+        SPANIO_CHECK(line.find("online 0") != std::string::npos);
+    }
+}
+
+// Case 15: with no sink (--quiet) nothing is logged and echoing still works
+// (every backend)
+SPANIO_TEST(coroutine_echo_quiet)
+{
+    SPANIO_CHECK(!coro_echo::log_state(coro_echo::log_sink()).enabled());
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        coro_echo_runner server(backend, coro_echo::log_sink());
+        spanio::test::socket_guard client;
+        SPANIO_REQUIRE(spanio::test::connect_client(server.port(), client));
+        SPANIO_CHECK(round_trip(client, std::string(kExampleMessageBytes, 'q')));
+    }
+}
+
+// Case 16: command line: --quiet anywhere; unknown options, ports and thread
+// counts out of range are rejected
+SPANIO_TEST(coroutine_echo_parse_arguments)
+{
+    coro_echo::options opts;
+    std::string error;
+    const char* const defaults[] = {"coro_echo_server"};
+    SPANIO_CHECK(coro_echo::parse_arguments(1, defaults, opts, error));
+    SPANIO_CHECK(opts.m_port == coro_echo::kDefaultPort);
+    SPANIO_CHECK(opts.m_threads == coro_echo::kDefaultThreads);
+    SPANIO_CHECK(!opts.m_quiet);
+
+    const char* const quiet_first[] = {"coro_echo_server", "--quiet", "8081", "4"};
+    SPANIO_CHECK(coro_echo::parse_arguments(4, quiet_first, opts, error));
+    SPANIO_CHECK(opts.m_quiet);
+    SPANIO_CHECK(opts.m_port == 8081);
+    SPANIO_CHECK(opts.m_threads == 4);
+
+    const char* const quiet_last[] = {"coro_echo_server", "8082", "--quiet"};
+    SPANIO_CHECK(coro_echo::parse_arguments(3, quiet_last, opts, error));
+    SPANIO_CHECK(opts.m_quiet);
+    SPANIO_CHECK(opts.m_port == 8082);
+
+    const char* const unknown[] = {"coro_echo_server", "--verbose"};
+    SPANIO_CHECK(!coro_echo::parse_arguments(2, unknown, opts, error));
+    SPANIO_CHECK(error.find("--verbose") != std::string::npos);
+    const char* const bad_port[] = {"coro_echo_server", "65536"};
+    SPANIO_CHECK(!coro_echo::parse_arguments(2, bad_port, opts, error));
+    const char* const zero_port[] = {"coro_echo_server", "0"};
+    SPANIO_CHECK(!coro_echo::parse_arguments(2, zero_port, opts, error));
+    const char* const bad_threads[] = {"coro_echo_server", "9000", "65"};
+    SPANIO_CHECK(!coro_echo::parse_arguments(3, bad_threads, opts, error));
+    const char* const too_many[] = {"coro_echo_server", "9000", "2", "3"};
+    SPANIO_CHECK(!coro_echo::parse_arguments(4, too_many, opts, error));
 }
 
 int main(int argc, char** argv)

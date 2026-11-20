@@ -913,7 +913,7 @@ context.run();                // as many threads as wanted, as in 1.2
 | `timer_demo` | `timer_demo` | `steady_timer` 在回调里重新等待，每半秒打印一次，三次后退出 |
 | `tcp_client` | `tcp_client <主机> <端口> <消息>` | 异步解析、按地址列表连接、`async_write` / `async_read`、整体超时 |
 | `udp_client` | `udp_client <主机> <端口> <消息>` | 同步解析、`async_send_to` / `async_receive_from`、等待超时 |
-| `coro_echo_server` | `coro_echo_server [端口] [线程数]` | 用 C++20 协程写的回显服务：一个协程负责 accept，每个连接一个协程（需 C++20） |
+| `coro_echo_server` | `coro_echo_server [端口] [线程数] [--quiet]` | 用 C++20 协程写的回显服务：一个协程负责 accept，每个连接一个协程（需 C++20）；与 `echo_server` 一样打印连接、收到的数据和断开原因，`--quiet` 关闭输出 |
 
 试一试：
 
