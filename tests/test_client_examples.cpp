@@ -123,7 +123,7 @@ public:
     // Parameter backend: proactor backend of the server's context
     explicit udp_echo_fixture(const backend_factory& backend)
         : m_context(make_context(backend))
-        , m_server(*m_context, spanio::udp::endpoint(spanio::ipv4::loopback(), kAnyPort))
+        , m_server(*m_context, spanio::udp::endpoint(spanio::ipv4::loopback(), kAnyPort), udp_echo::log_sink())
     {
         m_server.start();
         spanio::io_context& context = *m_context;

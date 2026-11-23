@@ -750,7 +750,7 @@ server.run();                    // 阻塞到 stop()
 
 `stats()` 返回 `udp_server_stats`，包含 `m_received / m_sent / m_queue_dropped / m_send_failed / m_truncated`。
 
-示例 `examples/udp_echo_server.cpp`（`udp_echo_server [port]`，默认端口 9000）基于 `udp_server` 实现。
+示例 `examples/udp_echo_server.cpp`（`udp_echo_server [port] [--idle seconds] [--quiet]`，默认端口 9000）基于 `udp_server` 实现。UDP 没有连接，示例自己跟踪对端地址：新地址的第一个报文打印 `[connect]`，每个报文打印 `[recv]`，空闲超过 `--idle` 秒（默认 60）或服务器停止时打印 `[close]`，格式与 `echo_server` 相同。地址表由互斥锁保护，空闲检查由一个 `steady_timer` 完成（间隔为空闲时长的 1/4，最长 1 秒）；最多跟踪 10000 个地址，超出的地址照常回显，只打印 `[recv]`。
 
 ### 6.8 定时器 steady_timer（v0.12）
 

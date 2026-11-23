@@ -521,7 +521,8 @@ SPANIO_TEST(udp_echo_example)
     {
         announce(backend);
         std::unique_ptr<io_context> ctx = make_context(backend);
-        udp_echo::udp_echo_server server(*ctx, udp::endpoint(spanio::ipv4::loopback(), kAnyPort));
+        udp_echo::udp_echo_server server(*ctx, udp::endpoint(spanio::ipv4::loopback(), kAnyPort),
+                                         udp_echo::log_sink());
         context_threads threads(*ctx);
         server.start();
         threads.start(kOneThread);
@@ -892,6 +893,410 @@ SPANIO_TEST(stop_drops_pending_sends)
         SPANIO_CHECK(elapsed_ms(start) < kWaitLimitMs);
         SPANIO_CHECK(!server.send_to(target, "too late"));
     }
+}
+
+// ---- udp_echo_server peer log ---------------------------------------------------
+
+namespace {
+
+// Idle time of the idle-close case: short, so the case stays fast
+constexpr std::chrono::milliseconds kShortIdle(200);
+
+// The idle close must not come much earlier than the idle time; the reply
+// arrives a little after the server recorded the datagram, so allow half
+constexpr long long kEarliestIdleCloseMs = 100;
+
+// Bytes in the long datagram of the truncation case: over the 64 shown
+constexpr std::size_t kLongLogDatagram = 100;
+
+// Plain bytes before a 2-byte UTF-8 character that straddles the 64-byte cut
+constexpr std::size_t kBytesBeforeSplitCharacter = 63;
+
+// Port given in the full command line of the parse case
+constexpr std::uint16_t kParsedPort = 1234;
+
+// Idle seconds given in the full command line of the parse case
+constexpr unsigned long kParsedIdle = 30;
+
+// Port given after the options in the parse case
+constexpr std::uint16_t kOptionsFirstPort = 80;
+
+// Idle seconds given before the port in the parse case
+constexpr unsigned long kOptionsFirstIdle = 5;
+
+// Number of entries of an argv array, as main() would get it
+// Parameter args: the array
+// Return value: its length
+template <std::size_t N>
+int argc_of(const char* const (&args)[N])
+{
+    static_cast<void>(args);
+    return static_cast<int>(N);
+}
+// Collects the example's log lines; thread-safe. It also counts sink calls
+// that overlap, since the example must hand lines over one at a time.
+class log_capture
+{
+public:
+    // A sink appending to this capture; the capture must outlive it
+    // Return value: the sink
+    udp_echo::log_sink sink()
+    {
+        auto add = [this](const std::string& line)
+        {
+            if (m_inside.fetch_add(1) != 0)
+            {
+                m_overlaps.fetch_add(1);
+            }
+            std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_lines.push_back(line);
+            }
+            m_inside.fetch_sub(1);
+        };
+        return udp_echo::log_sink(add);
+    }
+
+    // Number of sink calls that started while another was running
+    // Return value: 0 when the example serializes its lines
+    int overlaps() const
+    {
+        return m_overlaps.load();
+    }
+
+    // All lines so far
+    // Return value: a copy, in order
+    std::vector<std::string> lines() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_lines;
+    }
+
+    // Lines that contain a text, in order
+    // Parameter text: text to look for, e.g. an event tag
+    // Return value: the matching lines
+    std::vector<std::string> with(const std::string& text) const
+    {
+        std::vector<std::string> found;
+        for (const std::string& line : lines())
+        {
+            if (line.find(text) != std::string::npos)
+            {
+                found.push_back(line);
+            }
+        }
+        return found;
+    }
+
+    // Wait until at least a number of lines contain a text
+    // Parameter text:  text to look for
+    // Parameter count: lines needed
+    // Return value: true if they appeared within kWaitLimitMs
+    bool wait_for(const std::string& text, std::size_t count) const
+    {
+        auto enough = [this, &text, count]()
+        {
+            return with(text).size() >= count;
+        };
+        return wait_until(enough);
+    }
+
+private:
+    // Guards m_lines
+    mutable std::mutex m_mutex;
+    // Lines in the order they were written
+    std::vector<std::string> m_lines;
+    // Sink calls running right now
+    std::atomic<int> m_inside{0};
+    // Sink calls that found another one running
+    std::atomic<int> m_overlaps{0};
+};
+
+// The udp_echo_server example on 127.0.0.1 with one run() thread on a backend
+class echo_runner
+{
+public:
+    // Create and start the server
+    // Parameter backend: proactor backend to use
+    // Parameter sink:    log sink; empty for none
+    // Parameter idle:    idle time of the peer log
+    echo_runner(const backend_factory& backend, udp_echo::log_sink sink,
+                std::chrono::milliseconds idle = std::chrono::seconds(udp_echo::kDefaultIdleSeconds))
+        : m_context(make_context(backend))
+        , m_server(*m_context, udp::endpoint(spanio::ipv4::loopback(), kAnyPort), std::move(sink), idle)
+        , m_threads(*m_context)
+    {
+        m_server.start();
+        m_threads.start(kOneThread);
+    }
+
+    // Stop and join
+    ~echo_runner()
+    {
+        stop();
+    }
+
+    echo_runner(const echo_runner&) = delete;
+    echo_runner& operator=(const echo_runner&) = delete;
+
+    // Stop the server and wait for run() to return
+    void stop()
+    {
+        m_server.stop();
+        m_threads.join();
+    }
+
+    // Address of the server, or fail the case
+    // Return value: the endpoint
+    udp::endpoint address() const
+    {
+        std::error_code ec;
+        const udp::endpoint local = m_server.local_endpoint(ec);
+        SPANIO_REQUIRE(!ec);
+        return local;
+    }
+
+    // The server
+    // Return value: the example object
+    udp_echo::udp_echo_server& server()
+    {
+        return m_server;
+    }
+
+private:
+    // Context the server runs on; outlives the server
+    std::unique_ptr<io_context> m_context;
+    // The example server
+    udp_echo::udp_echo_server m_server;
+    // Thread calling run()
+    context_threads m_threads;
+};
+
+// Position of the first line containing a text
+// Parameter lines: the lines
+// Parameter text:  text to look for
+// Return value: the index, or lines.size() if none contains it
+std::size_t index_of(const std::vector<std::string>& lines, const std::string& text)
+{
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        if (lines[i].find(text) != std::string::npos)
+        {
+            return i;
+        }
+    }
+    return lines.size();
+}
+
+// Whether a line contains a text
+// Parameter line: the line
+// Parameter text: text to look for
+// Return value: true if found
+bool contains(const std::string& line, const std::string& text)
+{
+    return line.find(text) != std::string::npos;
+}
+
+}
+
+// Case 14: the first datagram of a peer logs [connect] with the online
+// count, then [recv] with its size and content; the echo still comes back
+SPANIO_TEST(udp_echo_logs_connect_and_recv)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture capture;
+        echo_runner runner(backend, capture.sink());
+        udp_client client;
+        SPANIO_REQUIRE(client.open());
+        SPANIO_CHECK(client.ping(runner.address(), "hello"));
+        SPANIO_REQUIRE(capture.wait_for("[recv]", 1));
+
+        const std::string peer = udp_echo::format_endpoint(client.local());
+        const std::vector<std::string> connects = capture.with("[connect]");
+        SPANIO_REQUIRE(connects.size() == 1);
+        SPANIO_CHECK(contains(connects[0], "[connect] " + peer + "  online 1"));
+        const std::vector<std::string> receives = capture.with("[recv]");
+        SPANIO_REQUIRE(receives.size() == 1);
+        SPANIO_CHECK(contains(receives[0], "[recv]    " + peer + "  5 bytes: hello"));
+        const std::vector<std::string> lines = capture.lines();
+        SPANIO_CHECK(index_of(lines, "[connect]") < index_of(lines, "[recv]"));
+    }
+}
+
+// Case 15: two peers are counted separately; a second datagram from a known
+// address logs no new [connect]
+SPANIO_TEST(udp_echo_logs_two_peers)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture capture;
+        echo_runner runner(backend, capture.sink());
+        udp_client first;
+        udp_client second;
+        SPANIO_REQUIRE(first.open());
+        SPANIO_REQUIRE(second.open());
+        SPANIO_CHECK(first.ping(runner.address(), "a1"));
+        SPANIO_CHECK(second.ping(runner.address(), "b1"));
+        SPANIO_CHECK(first.ping(runner.address(), "a2"));
+        SPANIO_REQUIRE(capture.wait_for("[recv]", 3));
+
+        const std::vector<std::string> connects = capture.with("[connect]");
+        SPANIO_REQUIRE(connects.size() == 2);
+        SPANIO_CHECK(contains(connects[0], udp_echo::format_endpoint(first.local()) + "  online 1"));
+        SPANIO_CHECK(contains(connects[1], udp_echo::format_endpoint(second.local()) + "  online 2"));
+        SPANIO_CHECK(capture.overlaps() == 0);
+    }
+}
+
+// Case 16: a peer silent for the idle time is closed with its counts; its
+// next datagram is a new [connect]
+SPANIO_TEST(udp_echo_idle_close)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture capture;
+        echo_runner runner(backend, capture.sink(), kShortIdle);
+        udp_client client;
+        SPANIO_REQUIRE(client.open());
+        SPANIO_CHECK(client.ping(runner.address(), "hi"));
+        SPANIO_CHECK(client.ping(runner.address(), "hey"));
+        const test_clock::time_point last = test_clock::now();
+        SPANIO_REQUIRE(capture.wait_for("[close]", 1));
+        SPANIO_CHECK(elapsed_ms(last) >= kEarliestIdleCloseMs);
+
+        const std::string peer = udp_echo::format_endpoint(client.local());
+        const std::vector<std::string> closes = capture.with("[close]");
+        SPANIO_REQUIRE(closes.size() == 1);
+        SPANIO_CHECK(contains(closes[0], "[close]   " + peer + "  idle timeout, 2 datagrams, 5 bytes received"));
+        SPANIO_CHECK(contains(closes[0], "online 0"));
+
+        SPANIO_CHECK(client.ping(runner.address(), "again"));
+        SPANIO_REQUIRE(capture.wait_for("[connect]", 2));
+        SPANIO_CHECK(contains(capture.with("[connect]")[1], peer + "  online 1"));
+    }
+}
+
+// Case 17: stop() closes every known peer with "server closed"
+SPANIO_TEST(udp_echo_stop_closes_peers)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture capture;
+        echo_runner runner(backend, capture.sink());
+        udp_client first;
+        udp_client second;
+        SPANIO_REQUIRE(first.open());
+        SPANIO_REQUIRE(second.open());
+        SPANIO_CHECK(first.ping(runner.address(), "one"));
+        SPANIO_CHECK(second.ping(runner.address(), "two"));
+        SPANIO_REQUIRE(capture.wait_for("[recv]", 2));
+        SPANIO_CHECK(capture.with("[close]").empty());
+
+        runner.stop();
+        const std::vector<std::string> closes = capture.with("[close]");
+        SPANIO_REQUIRE(closes.size() == 2);
+        SPANIO_CHECK(contains(closes[0], "server closed, 1 datagram, 3 bytes received"));
+        SPANIO_CHECK(contains(closes[1], "server closed, 1 datagram, 3 bytes received"));
+        SPANIO_CHECK(contains(closes[1], "online 0"));
+        const std::string all = closes[0] + closes[1];
+        SPANIO_CHECK(contains(all, udp_echo::format_endpoint(first.local())));
+        SPANIO_CHECK(contains(all, udp_echo::format_endpoint(second.local())));
+    }
+}
+
+// Case 18: [recv] escapes control characters and shows at most 64 bytes,
+// never cutting a UTF-8 character
+SPANIO_TEST(udp_echo_escapes_and_truncates)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        log_capture capture;
+        echo_runner runner(backend, capture.sink());
+        udp_client client;
+        SPANIO_REQUIRE(client.open());
+        const std::string control = std::string("a\r\n\t\\") + '\x01' + '\x7F';
+        const std::string long_data(kLongLogDatagram, 'x');
+        const std::string split = std::string(kBytesBeforeSplitCharacter, 'y') + "\xC3\xA9";
+        SPANIO_CHECK(client.ping(runner.address(), control));
+        SPANIO_CHECK(client.ping(runner.address(), long_data));
+        SPANIO_CHECK(client.ping(runner.address(), split));
+        SPANIO_REQUIRE(capture.wait_for("[recv]", 3));
+
+        const std::vector<std::string> receives = capture.with("[recv]");
+        SPANIO_REQUIRE(receives.size() == 3);
+        SPANIO_CHECK(contains(receives[0], "7 bytes: a\\r\\n\\t\\\\\\x01\\x7F"));
+        SPANIO_CHECK(contains(receives[1],
+                              "100 bytes: " + std::string(udp_echo::kShownBytes, 'x') + "... (100 bytes)"));
+        SPANIO_CHECK(contains(receives[2],
+                              "65 bytes: " + std::string(kBytesBeforeSplitCharacter, 'y') + "... (65 bytes)"));
+    }
+}
+
+// Case 19: with an empty sink nothing is logged and echoing still works
+SPANIO_TEST(udp_echo_quiet)
+{
+    for (const backend_factory& backend : backends())
+    {
+        announce(backend);
+        echo_runner runner(backend, udp_echo::log_sink());
+        udp_client client;
+        SPANIO_REQUIRE(client.open());
+        SPANIO_CHECK(client.ping(runner.address(), "quiet"));
+        auto counted = [&runner]()
+        {
+            return runner.server().stats().m_sent == 1;
+        };
+        SPANIO_CHECK(wait_until(counted));
+    }
+}
+
+// Case 20: command line of the example
+SPANIO_TEST(udp_echo_parse_arguments)
+{
+    udp_echo::options opts;
+    std::string error;
+
+    const char* const none[] = {"udp_echo_server"};
+    SPANIO_REQUIRE(udp_echo::parse_arguments(argc_of(none), none, opts, error));
+    SPANIO_CHECK(opts.m_port == udp_echo::kDefaultPort);
+    SPANIO_CHECK(opts.m_idle_seconds == udp_echo::kDefaultIdleSeconds);
+    SPANIO_CHECK(!opts.m_quiet);
+
+    const char* const full[] = {"udp_echo_server", "1234", "--idle", "30", "--quiet"};
+    SPANIO_REQUIRE(udp_echo::parse_arguments(argc_of(full), full, opts, error));
+    SPANIO_CHECK(opts.m_port == kParsedPort);
+    SPANIO_CHECK(opts.m_idle_seconds == kParsedIdle);
+    SPANIO_CHECK(opts.m_quiet);
+
+    const char* const options_first[] = {"udp_echo_server", "--quiet", "--idle", "5", "80"};
+    SPANIO_REQUIRE(udp_echo::parse_arguments(argc_of(options_first), options_first, opts, error));
+    SPANIO_CHECK(opts.m_port == kOptionsFirstPort);
+    SPANIO_CHECK(opts.m_idle_seconds == kOptionsFirstIdle);
+
+    const char* const idle_zero[] = {"udp_echo_server", "--idle", "0"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(idle_zero), idle_zero, opts, error));
+    const char* const idle_missing[] = {"udp_echo_server", "--idle"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(idle_missing), idle_missing, opts, error));
+    const char* const idle_text[] = {"udp_echo_server", "--idle", "abc"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(idle_text), idle_text, opts, error));
+    const char* const idle_too_long[] = {"udp_echo_server", "--idle", "86401"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(idle_too_long), idle_too_long, opts, error));
+    const char* const unknown[] = {"udp_echo_server", "--verbose"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(unknown), unknown, opts, error));
+    SPANIO_CHECK(contains(error, "--verbose"));
+    const char* const port_zero[] = {"udp_echo_server", "0"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(port_zero), port_zero, opts, error));
+    const char* const port_large[] = {"udp_echo_server", "70000"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(port_large), port_large, opts, error));
+    const char* const too_many[] = {"udp_echo_server", "1", "2"};
+    SPANIO_CHECK(!udp_echo::parse_arguments(argc_of(too_many), too_many, opts, error));
 }
 
 int main(int argc, char** argv)
