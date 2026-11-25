@@ -1,7 +1,13 @@
 # SpanIO 跨平台网络框架设计方案
 
-> 版本：v0.24（设计草案，按 M1 实现修订；库版本 0.4.0）
+> 版本：v0.25（设计草案，按 M1 实现修订；库版本 0.5.0）
 > 定位：Linux / Windows 双平台通用网络框架，融合 Proactor 与 Reactor 两种 IO 模型，统一接口、轻量易用。
+>
+> **v0.25 修订记录（2026-11-25）**：M5 第三项，TLS；库版本 0.5.0。
+> - 新增 `include/spanio/ssl.h`（C++17，需要 OpenSSL 3.0 及以上，`SPANIO_ENABLE_SSL`，默认关闭）：`ssl::context`、`ssl::stream`，错误类别 `spanio.ssl`、`spanio.ssl.verify`、`spanio.ssl.stream`，见 6.12。
+> - 与草案的差别：`bind_executor` 只影响最终回调，组合操作的中间步骤不在用户的 strand 上运行，因此 `stream` 内部自带锁，不要求用户使用 strand。
+> - 主机名核对使用 `X509_VERIFY_PARAM_set1_host` / `set1_ip_asc`，3.x 与 4.x 都未弃用（`SSL_set1_host` 自 4.0 起弃用）。
+> - 新增示例 `tls_echo_server`（C++20）、`tls_client`；新增 `tests/test_ssl.cpp`（14 个用例，证书在运行时生成）；指南新增第 10 章，原第 10–12 章顺延。
 >
 > **v0.24 修订记录（2026-11-19）**：M5 第二项，完成令牌与 C++20 协程；库版本 0.4.0。
 > - 新增 `include/spanio/async_result.h`（C++17）：`async_result<Token, Signature>`（主模板把令牌当作回调，`return_type` 为 `void`）、`async_return_t`、`async_initiate`；令牌 `use_future`（返回 `std::future<值>`）、`as_tuple(令牌)`（结果连同错误码打包成一个 `std::tuple` 交给内层令牌）、`detached`（丢弃结果）。"值"由签名决定：首参数为 `std::error_code` 时非空即抛 `std::system_error`，为 `std::exception_ptr` 时非空即重新抛出，其余参数无则 `void`、一个即其本身、多个为 `std::tuple`。
@@ -924,6 +930,27 @@ M3 结束时冻结公开 API，版本号定为 **0.3.0**（`include/spanio/versi
 
 测试：`tests/test_api.cpp`，7 个用例（`umbrella_header`、`internals_not_public`、`native_handle_type`、`async_read_exact`、`async_read_eof`、`async_read_edge_cases`、`user_data`；`async_read` 的三个用例在每个后端上各跑一遍）。多数检查在编译期完成：内部接口重新公开、枚举改回普通枚举、移入 `detail` 的常量名重新出现在公开命名空间，都会使这个文件编译失败。
 
+### 6.12 TLS（v0.25，版本 0.5.0）
+
+实现见 `include/spanio/ssl.h`。OpenSSL 只读写一对内存 BIO，密文经 `tcp::socket` 的异步操作收发，因此所有后端都不用改。
+
+| 类型 | 作用 |
+|---|---|
+| `ssl::context(role)` | 证书、私钥、CA、验证模式、版本范围；默认最低 TLS 1.2，客户端验证对端，关闭重新协商和会话复用 |
+| `ssl::stream(socket, context)` | `async_handshake`、`async_read_some`、`async_read`、`async_write_some`、`async_write`、`async_shutdown`、`set_verify_hostname`、`close` |
+
+实现约定：
+
+- 连接状态 `detail::ssl_core` 由 `stream` 与在途的 socket 操作共享，全部在一个互斥锁下使用。用户操作存放在四个槽里（握手、写、读、关闭），每种最多一个，第二个得到 `operation_in_progress`。
+- 底层同一时刻最多一个读和一个写；TLS 的读也可能产生待发数据，统一排进输出队列，保证记录顺序。
+- 写、握手和关闭要等自己产生的密文发完才完成；出错时也先发出告警。待发数据超过 64 KiB 时暂停读取，避免对端用密钥更新耗尽内存。
+- 不变式：有用户操作挂起时，必有底层读或写在途，因此每个操作恰好完成一次，`close()` 后得到 `operation_canceled`。
+- `io_context` 先被销毁时，底层操作的处理器未运行就析构，由它丢弃挂起的用户操作，否则"处理器持有 stream"的写法会形成环而泄漏。
+- 回调一律 `post`，不在发起函数里运行，也不在锁内运行。
+- `async_shutdown` 只发送自己的 `close_notify`。对端未发 `close_notify` 就断开，读到 `ssl_errors::stream_truncated`。
+
+测试：`tests/test_ssl.cpp`，14 个用例，I/O 用例在每个后端上各跑一遍。
+
 ## 七、轻量易用设计
 
 ### 7.1 Header-only 为主
@@ -1082,6 +1109,7 @@ spanio/
 │       ├── executor.h              # 执行器抽象
 │       ├── async_result.h          # 完成令牌：async_result、use_future、as_tuple、detached（已实现，M5）
 │       ├── coroutine.h             # C++20 协程：awaitable、use_awaitable、co_spawn（已实现，M5）
+│       ├── ssl.h                   # TLS：ssl::context、ssl::stream（已实现，M5，需 OpenSSL）
 │       ├── strand.h                # 串行化域 strand、make_strand、bind_executor（已实现）
 │       ├── version.h               # 版本号宏 SPANIO_VERSION_*（已实现，当前 0.4.0）
 │       ├── error.h                 # SpanIO 自有错误码（error::misc_errors::eof）（已实现）
@@ -1120,6 +1148,8 @@ spanio/
 │   ├── chat_server.cpp         # M2 示例：基于 tcp_server 的多用户聊天（已实现）
 │   ├── udp_echo_server.cpp     # M2 示例：基于 udp_server 的回显服务（已实现）
 │   ├── coro_echo_server.cpp    # M5 示例：C++20 协程写的回显服务（已实现）
+│   ├── tls_echo_server.cpp     # M5 示例：TLS 回显服务（已实现）
+│   ├── tls_client.cpp          # M5 示例：TLS 客户端（已实现）
 │   ├── tcp_client.cpp          # TCP 客户端示例：异步解析、按地址列表连接、async_read、整体超时（已实现）
 │   └── udp_client.cpp          # UDP 客户端示例：同步解析、收发数据报、等待超时（已实现）
 ├── tests/
@@ -1142,6 +1172,7 @@ spanio/
 │   ├── test_io_uring_proactor.cpp # io_uring 后端专有路径与运行期降级的测试（已实现，M5）
 │   ├── test_completion_tokens.cpp # use_future / as_tuple / detached 测试（已实现，M5）
 │   ├── test_coroutine.cpp      # C++20 协程测试（已实现，M5）
+│   ├── test_ssl.cpp            # TLS 测试（已实现，M5）
 │   ├── check_guide_snippets.cmake # 比对指南代码块与 test_guide.cpp（CTest：guide_snippets_match）（已实现）
 │   └── test_cross_platform.cpp
 ├── benchmark/
@@ -1246,7 +1277,7 @@ v0.6 验证情况：
 | M2 统一语义 | 完成 Reactor 模拟 Proactor，回调范式贯通；高层封装 tcp_server、udp_server | chat_server 示例（基于 tcp_server）；chat_server、udp_echo_server（**已完成**：Windows 与 Linux 均已验证） |
 | M3 易用性  | strand、timer、resolver、错误码统一；tcp_server / udp_server 的优雅关闭和超时 | API 冻结，编写文档（**已完成**：功能齐全，错误码统一，API 冻结于 0.3.0，使用指南 docs/guide.md） |
 | M4 性能   | 原子 work count、线程本地队列、内存池                                 | 基准测试报告（**已完成**：优化 `io_context` 任务队列并发（M4-A 原子 work count、M4-B 线程本地队列）与操作节点分配（M4-C 内存池），`post_rate` 4 线程从 1.78 M/s 提升到 23.68 M/s（+1230%），见 `docs/benchmark.md` 与 v0.3.1 Release） |
-| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐（**进行中**：io_uring 后端已完成，见 v0.23；完成令牌与 C++20 协程已完成，库版本 0.4.0，见 v0.24；TLS 待开发） |
+| M5 增强   | io_uring 后端、TLS、可选协程                            | 生产级特性补齐（**已完成**：io_uring 后端已完成，见 v0.23；完成令牌与 C++20 协程已完成，库版本 0.4.0，见 v0.24；TLS 已完成，库版本 0.5.0，见 v0.25） |
 
 ---
 

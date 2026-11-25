@@ -7,3 +7,6 @@ out/
 *.user
 CMakeUserPresets.json
 CLAUDE.md
+
+# Third-party source and builds (OpenSSL for SPANIO_ENABLE_SSL), never committed
+third_party/

@@ -10,7 +10,7 @@
 //               #endif
 //               std::puts(SPANIO_VERSION_STRING);
 // Developer:    lzwcracker@gmail.com
-// Date:         2026-11-10; updated 2026-11-15 (0.3.1: M4 performance); 2026-11-19 (0.4.0: completion tokens, coroutines, io_uring)
+// Date:         2026-11-10; updated 2026-11-15 (0.3.1: M4 performance); 2026-11-19 (0.4.0: completion tokens, coroutines, io_uring); 2026-11-25 (0.5.0: TLS)
 // ============================================================================
 
 #ifndef SPANIO_VERSION_H
@@ -20,7 +20,7 @@
 #define SPANIO_VERSION_MAJOR 0
 
 // Minor version: raised by additions; 3 is the API freeze at milestone M3
-#define SPANIO_VERSION_MINOR 4
+#define SPANIO_VERSION_MINOR 5
 
 // Patch version: raised by fixes that change no interface
 #define SPANIO_VERSION_PATCH 0
@@ -39,6 +39,6 @@
 #define SPANIO_VERSION SPANIO_MAKE_VERSION(SPANIO_VERSION_MAJOR, SPANIO_VERSION_MINOR, SPANIO_VERSION_PATCH)
 
 // This version as text
-#define SPANIO_VERSION_STRING "0.4.0"
+#define SPANIO_VERSION_STRING "0.5.0"
 
 #endif // SPANIO_VERSION_H

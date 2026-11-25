@@ -934,6 +934,88 @@ SPANIO_TEST(coroutine_echo_service)
     SPANIO_CHECK(reply == kHelloLine);
 }
 
+#if defined(SPANIO_ENABLE_SSL)
+// [snippet tls_session]
+spanio::awaitable<void> tls_echo_session(spanio::ssl::stream stream)
+{
+    co_await stream.async_handshake(spanio::use_awaitable);
+    char data[1024];
+    for (;;)
+    {
+        auto [ec, n] = co_await stream.async_read_some(spanio::buffer(data),
+                                                       spanio::as_tuple(spanio::use_awaitable));
+        if (ec)
+        {
+            break;            // eof: the peer said goodbye; stream_truncated: it just vanished
+        }
+        co_await stream.async_write(spanio::buffer(data, n), spanio::use_awaitable);
+    }
+    co_await stream.async_shutdown(spanio::use_awaitable);
+}
+// [/snippet]
+
+// [snippet tls_client]
+spanio::awaitable<std::string> tls_ask(spanio::tcp::socket socket, spanio::ssl::context& tls)
+{
+    // socket is connected; tls was made with role::client and trusts an authority
+    spanio::ssl::stream stream(std::move(socket), tls);
+    std::error_code ec = stream.set_verify_hostname("example.org");
+    if (ec)
+    {
+        throw std::system_error(ec);
+    }
+    co_await stream.async_handshake(spanio::use_awaitable);      // throws if the certificate is refused
+    std::string reply(5, '\0');
+    co_await stream.async_write(spanio::buffer("hello", 5), spanio::use_awaitable);
+    co_await stream.async_read(spanio::buffer(reply), spanio::use_awaitable);
+    co_await stream.async_shutdown(spanio::use_awaitable);
+    co_return reply;
+}
+// [/snippet]
+
+// Case: the TLS snippets report a peer that does not speak TLS as an error.
+// Full TLS exchanges are tested by test_ssl
+SPANIO_TEST(tls_snippets)
+{
+    spanio::io_context context;
+    spanio::ssl::context server_tls(spanio::ssl::role::server);
+    spanio::ssl::context client_tls(spanio::ssl::role::client);
+    socket_guard client;
+    socket_guard server;
+    spanio::test::make_tcp_pair(client, server);
+    spanio::tcp::socket client_socket(context);
+    spanio::tcp::socket server_socket(context);
+    SPANIO_REQUIRE(!client_socket.assign(client.release()));
+    SPANIO_REQUIRE(!server_socket.assign(server.release()));
+    // Without a certificate the server has to refuse every client
+    std::future<void> served = spanio::co_spawn(
+        context, tls_echo_session(spanio::ssl::stream(std::move(server_socket), server_tls)), spanio::use_future);
+    std::future<std::string> asked =
+        spanio::co_spawn(context, tls_ask(std::move(client_socket), client_tls), spanio::use_future);
+    context.run();
+    bool server_failed = false;
+    bool client_failed = false;
+    try
+    {
+        served.get();
+    }
+    catch (const std::system_error&)
+    {
+        server_failed = true;
+    }
+    try
+    {
+        asked.get();
+    }
+    catch (const std::system_error&)
+    {
+        client_failed = true;
+    }
+    SPANIO_CHECK(server_failed);
+    SPANIO_CHECK(client_failed);
+}
+#endif
+
 int main(int argc, char** argv)
 {
     return spanio::test::run_all(argc, argv);

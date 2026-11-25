@@ -16,9 +16,10 @@
 - [7. 域名解析](#7-域名解析)
 - [8. 多线程与 strand](#8-多线程与-strand)
 - [9. 完成令牌与协程](#9-完成令牌与协程)
-- [10. 错误码参考](#10-错误码参考)
-- [11. 平台说明](#11-平台说明)
-- [12. 常见问题](#12-常见问题)
+- [10. TLS](#10-tls)
+- [11. 错误码参考](#11-错误码参考)
+- [12. 平台说明](#12-平台说明)
+- [13. 常见问题](#13-常见问题)
 - [附录 A：API 速查](#附录-aapi-速查)
 - [附录 B：示例程序](#附录-b示例程序)
 
@@ -813,7 +814,74 @@ context.run();                // as many threads as wanted, as in 1.2
 为自己的令牌类型特化 `spanio::async_result<令牌类型, 签名>`，提供 `return_type` 和 `initiate()`，所有 `async_xxx` 就都能接受它；写法见 `spanio/async_result.h` 的文件头。
 
 ---
-## 10. 错误码参考
+## 10. TLS
+
+`spanio/ssl.h` 在 `tcp::socket` 上提供 TLS 1.2 / 1.3，加密由 OpenSSL（3.0 及以上）完成。这是唯一需要第三方库的功能，默认关闭。
+
+开启方法：CMake 选项 `-DSPANIO_ENABLE_SSL=ON`。查找 OpenSSL 的顺序：`-DOPENSSL_ROOT_DIR=...` 指定的位置；否则用 `third_party/openssl-install/`（存在时，静态链接）；否则用系统安装的版本。自己编译 OpenSSL 时用 `no-shared` 安装到这个目录即可；在源码目录外编译并带 `no-apps` 时，要先在编译目录里建好 `apps/include`。
+
+两个类型：
+
+- `ssl::context`：证书、私钥、信任的 CA 和各种设置，可供多个连接共用。要在创建第一个 `stream` 之前设置好。函数都返回错误码。先载入证书，再载入私钥。
+- `ssl::stream`：一个 TLS 连接，由一个已连接的 `tcp::socket` 构造。操作有 `async_handshake`、`async_read_some`、`async_read`、`async_write_some`、`async_write`、`async_shutdown`，都接受完成令牌。
+
+服务端的一个会话：
+
+<!-- snippet: tls_session -->
+```cpp
+spanio::awaitable<void> tls_echo_session(spanio::ssl::stream stream)
+{
+    co_await stream.async_handshake(spanio::use_awaitable);
+    char data[1024];
+    for (;;)
+    {
+        auto [ec, n] = co_await stream.async_read_some(spanio::buffer(data),
+                                                       spanio::as_tuple(spanio::use_awaitable));
+        if (ec)
+        {
+            break;            // eof: the peer said goodbye; stream_truncated: it just vanished
+        }
+        co_await stream.async_write(spanio::buffer(data, n), spanio::use_awaitable);
+    }
+    co_await stream.async_shutdown(spanio::use_awaitable);
+}
+```
+
+客户端：
+
+<!-- snippet: tls_client -->
+```cpp
+spanio::awaitable<std::string> tls_ask(spanio::tcp::socket socket, spanio::ssl::context& tls)
+{
+    // socket is connected; tls was made with role::client and trusts an authority
+    spanio::ssl::stream stream(std::move(socket), tls);
+    std::error_code ec = stream.set_verify_hostname("example.org");
+    if (ec)
+    {
+        throw std::system_error(ec);
+    }
+    co_await stream.async_handshake(spanio::use_awaitable);      // throws if the certificate is refused
+    std::string reply(5, '\0');
+    co_await stream.async_write(spanio::buffer("hello", 5), spanio::use_awaitable);
+    co_await stream.async_read(spanio::buffer(reply), spanio::use_awaitable);
+    co_await stream.async_shutdown(spanio::use_awaitable);
+    co_return reply;
+}
+```
+
+要点：
+
+- **验证**：客户端默认验证服务端证书，但只有调用了 `set_verify_hostname()` 才会核对名字；不调用的话，任何受信任的证书都能通过。信任的 CA 用 `load_verify_file()`、`add_certificate_authority()` 或 `set_default_verify_paths()` 设置。Windows 上的默认位置通常没有证书，也不读系统证书库。
+- **握手失败的原因**：证书问题是 `error::ssl_verify_category()` 里的 `X509_V_ERR_*`（过期、名字不符、不受信任等）；其他 TLS 错误在 `error::ssl_category()` 里。
+- **结束**：对端正常关闭时读到 `eof`；TCP 直接断开时读到 `error::ssl_errors::stream_truncated`，数据可能不完整。`async_shutdown` 只发送自己的关闭通知，不等对端的；想收完对端的数据就继续读到 `eof`。
+- **线程**：`stream` 内部自带锁，可以在任意线程发起操作，不需要 strand。读和写可以同时挂起，但同一种操作只能有一个，第二个得到 `operation_in_progress`。
+- **时间限制**：`stream` 不限制握手时长，需要时用 `steady_timer` 加 `close()`。
+- **不支持**：会话复用、DTLS、重新协商、加密的私钥文件、`tcp_server` 上的 TLS。
+
+完整的程序见 `examples/tls_echo_server.cpp` 和 `examples/tls_client.cpp`。
+
+---
+## 11. 错误码参考
 
 | 情况 | 错误码 |
 |---|---|
@@ -839,7 +907,7 @@ context.run();                // as many threads as wanted, as in 1.2
 
 ---
 
-## 11. 平台说明
+## 12. 平台说明
 
 | 平台 | 默认后端 | 说明 |
 |---|---|---|
@@ -854,7 +922,7 @@ context.run();                // as many threads as wanted, as in 1.2
 
 ---
 
-## 12. 常见问题
+## 13. 常见问题
 
 **`run()` 为什么立刻返回？**
 没有工作了。确认调用 `run()` 之前已经发起了异步操作；如果要让 `run()` 一直等新任务，用 `executor_work_guard`（2.1）。`run()` 返回过一次后，要先 `restart()` 才能再 `run()`。
@@ -914,6 +982,8 @@ context.run();                // as many threads as wanted, as in 1.2
 | `tcp_client` | `tcp_client <主机> <端口> <消息>` | 异步解析、按地址列表连接、`async_write` / `async_read`、整体超时 |
 | `udp_client` | `udp_client <主机> <端口> <消息>` | 同步解析、`async_send_to` / `async_receive_from`、等待超时 |
 | `coro_echo_server` | `coro_echo_server [端口] [线程数] [--quiet]` | 用 C++20 协程写的回显服务：一个协程负责 accept，每个连接一个协程（需 C++20）；与 `echo_server` 一样打印连接、收到的数据和断开原因，`--quiet` 关闭输出 |
+| `tls_echo_server` | `tls_echo_server <证书> <私钥> [端口]` | 用协程写的 TLS 回显服务（需 OpenSSL 和 C++20） |
+| `tls_client` | `tls_client <主机> <端口> <消息> [CA 文件]` | 验证服务端证书的 TLS 客户端，`use_future` 写法（需 OpenSSL） |
 
 试一试：
 

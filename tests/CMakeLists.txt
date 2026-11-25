@@ -34,6 +34,11 @@ set(SPANIO_TEST_NAMES
     test_coroutine
 )
 
+# The TLS tests exist only in builds with OpenSSL
+if(SPANIO_ENABLE_SSL)
+    list(APPEND SPANIO_TEST_NAMES test_ssl)
+endif()
+
 foreach(test_name IN LISTS SPANIO_TEST_NAMES)
     add_executable(${test_name} ${test_name}.cpp test_framework.h test_net_helpers.h
         test_proactor_backends.h test_proactor_decorators.h)
@@ -49,6 +54,9 @@ endforeach()
 # The coroutine tests need C++20; every other test keeps checking that the
 # library builds as C++17
 target_compile_features(test_coroutine PRIVATE cxx_std_20)
+if(SPANIO_ENABLE_SSL)
+    target_compile_features(test_ssl PRIVATE cxx_std_20)
+endif()
 
 # The guide's snippets include coroutines: build test_guide as C++20 with the
 # option's macro, which also checks that spanio/spanio.h then includes

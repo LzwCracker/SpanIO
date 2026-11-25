@@ -20,6 +20,11 @@ set(SPANIO_EXAMPLE_NAMES
     coro_echo_server
 )
 
+# The TLS examples need OpenSSL
+if(SPANIO_ENABLE_SSL)
+    list(APPEND SPANIO_EXAMPLE_NAMES tls_echo_server tls_client)
+endif()
+
 foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)
     add_executable(${example_name} ${example_name}.cpp)
     target_link_libraries(${example_name} PRIVATE spanio::spanio)
@@ -30,5 +35,8 @@ foreach(example_name IN LISTS SPANIO_EXAMPLE_NAMES)
     set_target_properties(${example_name} PROPERTIES FOLDER "examples")
 endforeach()
 
-# The coroutine example needs C++20; the others stay C++17
+# The coroutine examples need C++20; the others stay C++17
 target_compile_features(coro_echo_server PRIVATE cxx_std_20)
+if(SPANIO_ENABLE_SSL)
+    target_compile_features(tls_echo_server PRIVATE cxx_std_20)
+endif()

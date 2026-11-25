@@ -287,15 +287,15 @@ int async_result<api_test::ticket_token, void(std::error_code, std::size_t)>::in
 }
 
 }
-// Case 1: spanio/spanio.h alone provides the public API; the version is 0.4.0
+// Case 1: spanio/spanio.h alone provides the public API; the version is 0.5.0
 SPANIO_TEST(umbrella_header)
 {
     static_assert(SPANIO_VERSION_MAJOR == 0, "major version");
-    static_assert(SPANIO_VERSION_MINOR == 4, "minor version");
+    static_assert(SPANIO_VERSION_MINOR == 5, "minor version");
     static_assert(SPANIO_VERSION_PATCH == 0, "patch version");
-    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 4, 0), "combined version");
+    static_assert(SPANIO_VERSION == SPANIO_MAKE_VERSION(0, 5, 0), "combined version");
     static_assert(SPANIO_MAKE_VERSION(0, 4, 0) > SPANIO_MAKE_VERSION(0, 3, 1), "versions compare in order");
-    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.4.0") == 0);
+    SPANIO_CHECK(std::strcmp(SPANIO_VERSION_STRING, "0.5.0") == 0);
 
     // One type or function from every public header
     static_assert(std::is_class<spanio::io_context>::value, "io_context.h");

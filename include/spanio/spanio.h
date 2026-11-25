@@ -34,4 +34,9 @@
 #include "spanio/coroutine.h"
 #endif
 
+// TLS is opt-in, because it needs OpenSSL
+#if defined(SPANIO_ENABLE_SSL)
+#include "spanio/ssl.h"
+#endif
+
 #endif // SPANIO_SPANIO_H
