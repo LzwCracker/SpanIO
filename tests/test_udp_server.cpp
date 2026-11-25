@@ -900,11 +900,11 @@ SPANIO_TEST(stop_drops_pending_sends)
 namespace {
 
 // Idle time of the idle-close case: short, so the case stays fast
-constexpr std::chrono::milliseconds kShortIdle(200);
+constexpr std::chrono::milliseconds kShortIdle(500);
 
 // The idle close must not come much earlier than the idle time; the reply
 // arrives a little after the server recorded the datagram, so allow half
-constexpr long long kEarliestIdleCloseMs = 100;
+constexpr long long kEarliestIdleCloseMs = 250;
 
 // Bytes in the long datagram of the truncation case: over the 64 shown
 constexpr std::size_t kLongLogDatagram = 100;
